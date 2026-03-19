@@ -1,0 +1,21 @@
+# Build
+/target/
+
+# Config with secrets (keep example)
+config.toml
+
+# Env
+.env
+.env.local
+*.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Output (optional)
+report.json
+*.log

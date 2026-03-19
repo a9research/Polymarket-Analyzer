@@ -1,0 +1,31 @@
+# Default request spacing between upstream API calls (milliseconds)
+rate_limit_ms = 150
+
+# Cache TTL in seconds
+cache_ttl_sec = 600
+
+# Optional: can also be provided by env var DATABASE_URL
+database_url = "postgres://postgres:postgres@localhost:5432/polymarket_analyzer"
+
+[market_type]
+default_type = "unknown"
+
+[[market_type.rules]]
+kind = "contains"
+contains = "5-min"
+type = "5-min"
+
+[[market_type.rules]]
+kind = "contains"
+contains = "1h"
+type = "1h"
+
+[[market_type.rules]]
+kind = "contains"
+contains = "daily"
+type = "daily"
+
+[[market_type.rules]]
+kind = "contains"
+contains = "politics"
+type = "politics"
