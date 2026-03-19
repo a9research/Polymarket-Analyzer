@@ -40,7 +40,9 @@ impl DataApiClient {
             let page = match page {
                 Ok(p) => p,
                 Err(e) => {
-                    let msg = e.to_string();
+                    // `e.to_string()` may only show the outer `with_context` message; the API body
+                    // lives on inner causes. Join the full chain so we can detect offset limits.
+                    let msg = anyhow_error_chain_text(&e);
                     if let Some(max_off) = parse_max_offset_exceeded(&msg) {
                         tracing::warn!(
                             "data-api returned max offset exceeded; stopping further pages. wallet={} offset={} max_off={}",
@@ -141,6 +143,13 @@ pub struct TradesAllResult {
     pub trades: Vec<Trade>,
     pub truncated: bool,
     pub max_offset_allowed: Option<u32>,
+}
+
+fn anyhow_error_chain_text(e: &anyhow::Error) -> String {
+    e.chain()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_max_offset_exceeded(msg: &str) -> Option<u32> {
