@@ -103,6 +103,12 @@ cargo run --example subgraph_spike -- --introspect-redemption --skip-wallet-quer
 
 # 对指定钱包探测：redemptions + orderFilledEvents(maker/taker) + userPositions
 cargo run --example subgraph_spike -- 0xYourWallet...
+
+# 合并结果写入 JSON 文件（终端不全时用这个；默认不再把大段 JSON 打到 stdout）
+cargo run --example subgraph_spike -- --out subgraph_spike.json 0xYourWallet...
+
+# 仍要同时在终端打印各段 JSON（可能很长）
+cargo run --example subgraph_spike -- --out subgraph_spike.json --tee 0xYourWallet...
 ```
 
 子图文档：[Polymarket Subgraph](https://docs.polymarket.com/market-data/subgraph)
