@@ -93,6 +93,20 @@ cp config.example.toml config.toml
 - Rust（Axum 0.7、tokio、reqwest + rustls、serde、chrono、anyhow、clap 4）
 - 可选：sqlx + Postgres 缓存
 
+## Subgraph spike（可行性探针）
+
+在接链上全量/结算数据前进主架构前，可用示例对 **Goldsky 官方子图** 发 GraphQL，验证地址过滤与字段是否与 Playground 一致：
+
+```bash
+# 看 Activity 里 Redemption 类型有哪些字段
+cargo run --example subgraph_spike -- --introspect-redemption --skip-wallet-queries
+
+# 对指定钱包探测：redemptions + orderFilledEvents(maker/taker) + userPositions
+cargo run --example subgraph_spike -- 0xYourWallet...
+```
+
+子图文档：[Polymarket Subgraph](https://docs.polymarket.com/market-data/subgraph)
+
 ## 许可证
 
 Apache-2.0
