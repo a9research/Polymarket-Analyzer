@@ -63,6 +63,7 @@ cp config.example.toml config.toml
 | `rate_limit_ms` | 请求间隔（毫秒） | 150 |
 | `cache_ttl_sec` | 缓存有效期（秒） | 600 |
 | `timeout_sec` | HTTP 超时（秒） | 90 |
+| `trades_page_limit` | `/trades` 每页条数（与 offset 步长一致，最大 10000） | 500；可设 3000 减少请求次数 |
 | `database_url` | Postgres 连接串（可选） | 无，也可用环境变量 `DATABASE_URL` |
 | `[market_type]` | 市场类型分类规则（slug → type） | 见 `config.example.toml` |
 
@@ -73,6 +74,19 @@ cp config.example.toml config.toml
 - [Polymarket Data API](https://data-api.polymarket.com)（公开，无需认证）
   - `GET /trades?user={wallet}&limit=500&offset={n}`：分页拉取全部 trades
 - 可选：[Gamma API](https://gamma-api.polymarket.com) 用于市场元信息（如 endDate/closedTime）补全
+
+### 关于「分页」与历史深度上限（重要）
+
+**本工具已经在做分页**：按 `limit`（例如 500）递增 `offset` 逐页请求，直到返回空页或遇到服务端限制。
+
+报错 **`max historical activity offset of 3000 exceeded`** 来自 **Polymarket 服务端对「历史活动」的 offset 硬上限**，不是「客户端没分页」造成的。在该限制下，即使用更小的 `limit` 分页，**也无法用更大的 `offset` 继续往更早的历史翻页**（上限由服务端决定）。
+
+当前实现会在触发该限制时 **停止继续请求**，并返回已获取到的 trades；报告里会有：
+
+- `data_fetch.truncated: true`
+- `data_fetch.max_offset_allowed`（若可从错误信息解析，一般为 `3000`）
+
+若你需要 **超出该 API 窗口的完整链上历史**，需要走其他数据源（例如官方文档提到的 **Subgraph / 链上索引** 等），而不是仅靠当前 `GET /trades` 的 offset 翻页。
 
 ## 技术栈
 

@@ -1,6 +1,9 @@
 # Default request spacing between upstream API calls (milliseconds)
 rate_limit_ms = 150
 
+# Trades page size for GET /trades (same as offset step). Example: 3000 => usually 2 requests up to max offset 3000.
+# trades_page_limit = 3000
+
 # Cache TTL in seconds
 cache_ttl_sec = 600
 

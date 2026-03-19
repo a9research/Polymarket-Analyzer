@@ -136,7 +136,9 @@ async fn analyze_wallet(
     let data = DataApiClient::new(http.clone(), rate);
     let _ = (http, rate);
 
-    let trades_result = data.trades_all(wallet).await?;
+    let trades_result = data
+        .trades_all(wallet, cfg.trades_page_limit)
+        .await?;
     let report = build_report(
         cfg,
         wallet,

@@ -12,8 +12,17 @@ pub struct AppConfig {
     #[serde(default)]
     pub timeout_sec: u64,
 
+    /// Page size for `GET /trades` (also used as offset step). Data API allows up to 10000.
+    /// Use 3000 to minimize round-trips when max historical offset is 3000 (typically 2 requests).
+    #[serde(default = "default_trades_page_limit")]
+    pub trades_page_limit: u32,
+
     #[serde(default)]
     pub market_type: MarketTypeConfig,
+}
+
+fn default_trades_page_limit() -> u32 {
+    500
 }
 
 impl Default for AppConfig {
@@ -23,6 +32,7 @@ impl Default for AppConfig {
             cache_ttl_sec: 600,
             database_url: None,
             timeout_sec: 90,
+            trades_page_limit: default_trades_page_limit(),
             market_type: MarketTypeConfig::default(),
         }
     }
@@ -131,6 +141,11 @@ impl Merge for AppConfig {
                 self.timeout_sec
             } else {
                 other.timeout_sec
+            },
+            trades_page_limit: if other.trades_page_limit == 0 {
+                self.trades_page_limit
+            } else {
+                other.trades_page_limit
             },
             market_type: self.market_type.merge(other.market_type),
         }

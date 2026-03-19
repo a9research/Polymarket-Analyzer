@@ -19,10 +19,12 @@ impl DataApiClient {
         }
     }
 
-    pub async fn trades_all(&self, wallet: &str) -> anyhow::Result<TradesAllResult> {
+    /// `page_limit`: `limit` query param and offset increment (must be consistent).
+    pub async fn trades_all(&self, wallet: &str, page_limit: u32) -> anyhow::Result<TradesAllResult> {
         let mut out = Vec::new();
         let mut offset: u32 = 0;
-        let limit: u32 = 500;
+        // Data API: limit max 10000 per OpenAPI.
+        let limit: u32 = page_limit.clamp(1, 10_000);
         let mut max_offset_allowed: Option<u32> = None;
 
         loop {
