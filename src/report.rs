@@ -9,10 +9,22 @@ pub struct AnalyzeReport {
     pub lifetime: LifetimeMetrics,
     pub market_distribution: Vec<MarketDistributionItem>,
     pub price_buckets: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub data_fetch: DataFetchMeta,
     pub time_analysis: TimeAnalysis,
     pub trading_patterns: TradingPatterns,
     pub strategy_inference: StrategyInference,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DataFetchMeta {
+    /// Whether upstream data was truncated due to API historical offset limits.
+    #[serde(default)]
+    pub truncated: bool,
+    /// The max offset reported by upstream (when parseable).
+    #[serde(default)]
+    pub max_offset_allowed: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

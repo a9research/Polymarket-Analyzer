@@ -19,16 +19,43 @@ impl DataApiClient {
         }
     }
 
-    pub async fn trades_all(&self, wallet: &str) -> anyhow::Result<Vec<Trade>> {
+    pub async fn trades_all(&self, wallet: &str) -> anyhow::Result<TradesAllResult> {
         let mut out = Vec::new();
         let mut offset: u32 = 0;
         let limit: u32 = 500;
+        let mut max_offset_allowed: Option<u32> = None;
 
         loop {
+            if let Some(max) = max_offset_allowed {
+                if offset > max {
+                    break;
+                }
+            }
+
             let page = self
                 .trades_page(wallet, limit, offset)
                 .await
-                .with_context(|| format!("fetch trades page offset={offset} limit={limit}"))?;
+                .with_context(|| format!("fetch trades page offset={offset} limit={limit}"));
+
+            let page = match page {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if let Some(max_off) = parse_max_offset_exceeded(&msg) {
+                        tracing::warn!(
+                            "data-api returned max offset exceeded; stopping further pages. wallet={} offset={} max_off={}",
+                            wallet,
+                            offset,
+                            max_off
+                        );
+                        max_offset_allowed = Some(max_off);
+                        // The failing offset is already beyond allowed max, so stop.
+                        break;
+                    }
+                    return Err(e);
+                }
+            };
+
             if page.is_empty() {
                 break;
             }
@@ -37,7 +64,11 @@ impl DataApiClient {
             tokio::time::sleep(self.rate_limit).await;
         }
 
-        Ok(out)
+        Ok(TradesAllResult {
+            trades: out,
+            truncated: max_offset_allowed.is_some(),
+            max_offset_allowed,
+        })
     }
 
     pub async fn trades_page(
@@ -102,6 +133,31 @@ impl DataApiClient {
             MAX_ATTEMPTS,
             last_err.unwrap_or_else(|| "unknown".to_string())
         );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TradesAllResult {
+    pub trades: Vec<Trade>,
+    pub truncated: bool,
+    pub max_offset_allowed: Option<u32>,
+}
+
+fn parse_max_offset_exceeded(msg: &str) -> Option<u32> {
+    // Example body: {"error":"max historical activity offset of 3000 exceeded"}
+    let marker = "max historical activity offset of ";
+    let Some(start) = msg.find(marker) else {
+        return None;
+    };
+    let rest = &msg[start + marker.len()..];
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
     }
 }
 

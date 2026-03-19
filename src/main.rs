@@ -4,8 +4,8 @@ use polymarket_account_analyzer::{
     config::{load_config, AppConfig},
     polymarket::data_api::{DataApiClient, Trade, TradeSide},
     report::{
-        AnalyzeReport, LifetimeMetrics, MarketDistributionItem, SideBias, StrategyInference,
-        TimeAnalysis, TradingPatterns, WinRateByMarketType,
+        AnalyzeReport, DataFetchMeta, LifetimeMetrics, MarketDistributionItem, SideBias,
+        StrategyInference, TimeAnalysis, TradingPatterns, WinRateByMarketType,
     },
     storage::Storage,
 };
@@ -92,9 +92,19 @@ async fn init_storage(cfg: &AppConfig) -> anyhow::Result<Option<Storage>> {
         return Ok(None);
     };
 
-    let storage = Storage::connect(&database_url).await?;
-    storage.init_schema().await?;
-    Ok(Some(storage))
+    match Storage::connect(&database_url).await {
+        Ok(storage) => {
+            if let Err(e) = storage.init_schema().await {
+                tracing::warn!("postgres schema init failed; disabling cache: {e:#}");
+                return Ok(None);
+            }
+            Ok(Some(storage))
+        }
+        Err(e) => {
+            tracing::warn!("postgres connect failed; disabling cache: {e:#}");
+            Ok(None)
+        }
+    }
 }
 
 async fn analyze_wallet(
@@ -126,9 +136,14 @@ async fn analyze_wallet(
     let data = DataApiClient::new(http.clone(), rate);
     let _ = (http, rate);
 
-    let trades = data.trades_all(wallet).await?;
-
-    let report = build_report(cfg, wallet, &trades);
+    let trades_result = data.trades_all(wallet).await?;
+    let report = build_report(
+        cfg,
+        wallet,
+        &trades_result.trades,
+        trades_result.truncated,
+        trades_result.max_offset_allowed,
+    );
 
     if let Some(store) = storage {
         store.upsert_report(wallet, &report).await?;
@@ -137,7 +152,13 @@ async fn analyze_wallet(
     Ok(report)
 }
 
-fn build_report(cfg: &AppConfig, wallet: &str, trades: &[Trade]) -> AnalyzeReport {
+fn build_report(
+    cfg: &AppConfig,
+    wallet: &str,
+    trades: &[Trade],
+    truncated: bool,
+    max_offset_allowed: Option<u32>,
+) -> AnalyzeReport {
     let mut total_volume = 0.0_f64;
     let mut net_pnl = 0.0_f64;
     let mut max_single_win = 0.0_f64;
@@ -303,6 +324,10 @@ fn build_report(cfg: &AppConfig, wallet: &str, trades: &[Trade]) -> AnalyzeRepor
         wallet: wallet.to_string(),
         trades_count: trades.len(),
         total_volume,
+        data_fetch: DataFetchMeta {
+            truncated,
+            max_offset_allowed,
+        },
         lifetime: LifetimeMetrics {
             total_trades: trades.len(),
             total_volume,
@@ -316,10 +341,21 @@ fn build_report(cfg: &AppConfig, wallet: &str, trades: &[Trade]) -> AnalyzeRepor
         time_analysis,
         trading_patterns,
         strategy_inference,
-        notes: vec![
+        notes: {
+            let mut notes = vec![
             "PnL and win-rate are trade-level (cash flow); position reconstruction and Gamma metadata for entry/holding time next."
                 .to_string(),
-        ],
+            ];
+            if truncated {
+                notes.push(format!(
+                    "Data API trades were truncated due to upstream historical offset limit (max_offset_allowed={})",
+                    max_offset_allowed
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+            notes
+        },
     }
 }
 
