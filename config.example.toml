@@ -15,6 +15,9 @@ cache_ttl_sec = 600
 # Postgres：若此处留空/删除，则使用环境变量 DATABASE_URL；若两者都有，以本文件为准
 database_url = "postgres://postgres:postgres@localhost:5432/polymarket_analyzer"
 
+# 浏览器（如 Vercel 子域名）直连 serve 时的 CORS；逗号分隔 Origin。也可用环境变量 PAA_CORS_ORIGINS。
+# cors_allowed_origins = "https://stats.example.com,http://localhost:3000"
+
 # --- Subgraph（Goldsky）；enabled 或 CLI/API --with-subgraph 时参与 analyze ---
 [subgraph]
 # 默认 false；改为 true 或与 --with-subgraph 联用
@@ -56,6 +59,17 @@ enabled = false
 # --- Raw ingestion: write ingestion_run + raw_ingestion_chunk when DATABASE_URL is set ---
 [ingestion]
 persist_raw = true
+# Gamma markets/slug 调用上限（去重 slug），用于 entry→resolution 计时；0 = 不调 Gamma（省请求）
+# max_gamma_slugs_for_timing = 150
+# Data API /positions、/closed-positions 每页 limit；0 = 使用 trades_page_limit
+# data_api_positions_limit = 0
+# persist_raw 时是否写入 raw_data_api_open_positions / raw_data_api_closed_positions
+# persist_positions_raw = true
+# 是否写入 wallet_* 管线快照（规范化主交易行、可选 canonical 行、对账/前端/策略/整份报告）— 见 artifacts/wallet-pipeline-snapshot.md
+# persist_wallet_snapshots = true
+# PG 已有 wallet_primary_trade_row 时对 /trades 按水位增量拉取（依赖 API 新在前排序）
+# data_api_incremental_trades = true
+# data_api_incremental_max_pages = 250
 
 # --- Canonical merge (Postgres): raw_* row tables, markets_dim, canonical_events, source_event_map, reconciliation_report ---
 [canonical]

@@ -7,7 +7,11 @@ use polymarket_account_analyzer::{
     },
     config::{apply_env_overrides, load_config, report_cache_key, AppConfig, ReconciliationConfig},
     polymarket::{
-        data_api::{DataApiClient, Trade, TradeSide},
+        data_api::{
+            merge_trades_incremental, trade_timestamp_ms, wallet_trades_watermark_ms,
+            ClosedPosition, DataApiClient,
+            Trade, TradeSide, TradesAllResult, UserPosition,
+        },
         gamma_api::GammaApiClient,
         subgraph::{fetch_subgraph_for_wallet, SubgraphWalletParams},
     },
@@ -18,17 +22,163 @@ use polymarket_account_analyzer::{
     },
     report::{
         AnalyzeReport, CanonicalSummary, DataApiTruncationMeta, DataFetchMeta, DataLineage,
-        IngestionMeta, IngestionTruncation, LifetimeMetrics, MarketDistributionItem,
-        ReportProvenance, SideBias, StrategyInference, TimeAnalysis,
+        FrontendPresentation, GammaProfileSummary, IngestionMeta, IngestionTruncation,
+        LifetimeMetrics, MarketDistributionItem, NormalizedPriceBucket, PositionRowDisplay,
+        ReportProvenance, SideBias, StrategyInference, TimeAnalysis, TradeHighlight,
         TradingPatterns, WinRateByMarketType,
     },
-    storage::Storage,
+    storage::{Storage, WalletPipelineSnapshotMeta},
+    strategy::{self, StrategyInputs},
+    trade_pnl,
 };
 use reqwest::Client;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{path::PathBuf, time::Duration};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+/// Extra Data API + Gamma data merged into `build_report` (schema 2.1+).
+#[derive(Default)]
+struct ReportAugment {
+    resolution_ts_by_slug: HashMap<String, i64>,
+    open_positions: Vec<UserPosition>,
+    closed_positions: Vec<ClosedPosition>,
+    gamma_profile: Option<GammaProfileSummary>,
+}
+
+fn trade_ts_sec(t: &Trade) -> i64 {
+    let ts = t.timestamp;
+    if ts > 1_000_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    }
+}
+
+fn percentile_i64_sorted(sorted: &[i64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as usize;
+    Some(sorted[idx.min(sorted.len() - 1)] as f64)
+}
+
+async fn fetch_resolution_times_for_trades(
+    gamma: &GammaApiClient,
+    trades: &[Trade],
+    max_slugs: usize,
+) -> HashMap<String, i64> {
+    if max_slugs == 0 {
+        return HashMap::new();
+    }
+    let slugs_set: HashSet<String> = trades.iter().map(|t| t.slug.clone()).collect();
+    let mut slugs: Vec<String> = slugs_set.into_iter().collect();
+    slugs.sort();
+    let mut out = HashMap::new();
+    for slug in slugs.into_iter().take(max_slugs) {
+        match gamma.market_by_slug(&slug).await {
+            Ok(m) => {
+                let ts = m
+                    .closed_time
+                    .as_deref()
+                    .and_then(parse_gamma_datetime_utc)
+                    .or_else(|| m.end_date.as_deref().and_then(parse_gamma_datetime_utc));
+                if let Some(dt) = ts {
+                    out.insert(slug, dt.timestamp());
+                }
+            }
+            Err(e) => tracing::debug!("gamma resolution time skip slug={slug} err={e:#}"),
+        }
+    }
+    out
+}
+
+fn build_frontend_presentation(
+    wallet: &str,
+    trades: &[Trade],
+    per_trade_pnl: &[f64],
+    open: &[UserPosition],
+    primary_style: &str,
+    win_rate: f64,
+    total_vol: f64,
+) -> FrontendPresentation {
+    let mut scored: Vec<TradeHighlight> = trades
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let vol = t.size * t.price;
+            let cash_flow = match t.side {
+                TradeSide::Buy => -vol,
+                TradeSide::Sell => vol,
+            };
+            let pnl = per_trade_pnl.get(i).copied().unwrap_or(0.0);
+            TradeHighlight {
+                slug: t.slug.clone(),
+                side: match t.side {
+                    TradeSide::Buy => "BUY".to_string(),
+                    TradeSide::Sell => "SELL".to_string(),
+                },
+                price: t.price,
+                size: t.size,
+                pnl,
+                cash_flow,
+                timestamp: t.timestamp,
+                title: t.title.clone(),
+            }
+        })
+        .collect();
+
+    let mut wins: Vec<TradeHighlight> = scored
+        .iter()
+        .filter(|h| h.pnl > 0.0)
+        .cloned()
+        .collect();
+    wins.sort_by(|a, b| b.pnl.partial_cmp(&a.pnl).unwrap_or(std::cmp::Ordering::Equal));
+    wins.truncate(5);
+
+    let mut losses: Vec<TradeHighlight> = scored
+        .iter()
+        .filter(|h| h.pnl < 0.0)
+        .cloned()
+        .collect();
+    losses.sort_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap_or(std::cmp::Ordering::Equal));
+    losses.truncate(5);
+
+    scored.sort_by_key(|h| h.timestamp);
+    let recent: Vec<TradeHighlight> = scored.iter().rev().take(20).cloned().collect();
+
+    let current_positions: Vec<PositionRowDisplay> = open
+        .iter()
+        .take(50)
+        .map(|p| PositionRowDisplay {
+            slug: p.slug.clone(),
+            title: p.title.clone(),
+            outcome: p.outcome.clone(),
+            size: p.size,
+            avg_price: p.avg_price,
+            cur_price: p.cur_price,
+            cash_pnl: p.cash_pnl,
+            current_value: p.current_value,
+        })
+        .collect();
+
+    let ai_copy_prompt = format!(
+        "Analyze Polymarket wallet {}.\nApprox {} trades; notional volume {:.2} (trade cash-flow basis).\nInferred style: {}.\nPer-trade win rate ~{:.1}% (cash-flow sign).\nfrontend.*.pnl = realized PnL on sells (average-cost inventory per outcome).\nUse strategy_inference.rule_json (entry P90, jackpot_bias, preferred_price_ranges) and frontend.biggest_wins/losses (sort by pnl).",
+        wallet,
+        trades.len(),
+        total_vol,
+        primary_style,
+        win_rate
+    );
+
+    FrontendPresentation {
+        biggest_wins: wins,
+        biggest_losses: losses,
+        recent_trades: recent,
+        current_positions,
+        ai_copy_prompt,
+    }
+}
 
 /// Shadow 体积与主报告差异告警：写入对账摘要、v1 notes；若无 v1 则写入 `report.notes`。
 fn apply_shadow_volume_quality_alert(
@@ -153,6 +303,13 @@ struct AnalyzeQuery {
     with_canonical: bool,
     #[serde(default)]
     no_canonical: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LeaderboardQuery {
+    /// 1–100, default 30.
+    #[serde(default)]
+    limit: Option<i64>,
 }
 
 impl From<&AnalyzeQuery> for AnalyzeOverrides {
@@ -360,7 +517,14 @@ async fn report_from_canonical_pg_run(
         );
     }
 
-    let mut report = build_report(cfg, &wallet, &synth, false, None);
+    let mut report = build_report(
+        cfg,
+        &wallet,
+        &synth,
+        false,
+        None,
+        &ReportAugment::default(),
+    );
     report.notes.insert(
         0,
         format!(
@@ -430,7 +594,14 @@ async fn report_from_canonical_pg_run(
 
     if write_cache {
         let cache_key = report_cache_key(&wallet, cfg);
+        let pnls = trade_pnl::per_trade_realized_pnl(&synth);
         store.upsert_report(&cache_key, &wallet, &report).await?;
+        store
+            .replace_wallet_trade_pnls(&cache_key, &wallet, &synth, &pnls)
+            .await?;
+        store
+            .upsert_leaderboard_row(&wallet, &cache_key, &report)
+            .await?;
     }
 
     Ok(report)
@@ -443,6 +614,7 @@ async fn analyze_wallet(
     no_cache: bool,
 ) -> anyhow::Result<AnalyzeReport> {
     let cache_key = report_cache_key(wallet, cfg);
+    let w = wallet.to_lowercase();
 
     if !no_cache {
         if let Some(store) = storage {
@@ -450,6 +622,96 @@ async fn analyze_wallet(
                 .get_cached_report(&cache_key, wallet, cfg.cache_ttl_sec as i64)
                 .await?
             {
+                if cfg.ingestion.persist_wallet_snapshots {
+                    let mut refreshed_trades_on_hit = false;
+                    if cfg.ingestion.data_api_incremental_trades {
+                        let prev = store
+                            .fetch_wallet_primary_trades(&w)
+                            .await
+                            .unwrap_or_default();
+                        if let Some(wm) = wallet_trades_watermark_ms(&prev) {
+                            let timeout = Duration::from_secs(cfg.timeout_sec.max(10));
+                            let http_hit = Client::builder()
+                                .user_agent("polymarket-account-analyzer/0.1")
+                                .timeout(timeout)
+                                .connect_timeout(Duration::from_secs(15))
+                                .no_proxy()
+                                .build()?;
+                            let rate_hit = Duration::from_millis(cfg.rate_limit_ms);
+                            let data_hit = DataApiClient::new(http_hit, rate_hit);
+                            if let Ok((delta, _, _)) = data_hit
+                                .trades_since_watermark(
+                                    wallet,
+                                    cfg.trades_page_limit,
+                                    wm,
+                                    cfg.ingestion.data_api_incremental_max_pages,
+                                )
+                                .await
+                            {
+                                if !delta.is_empty() {
+                                    let merged = merge_trades_incremental(prev, delta);
+                                    let pnls = trade_pnl::per_trade_realized_pnl(&merged);
+                                    let canon = store
+                                        .fetch_wallet_canonical_event_rows(&w)
+                                        .await
+                                        .unwrap_or_default();
+                                    let canon_opt = if canon.is_empty() {
+                                        None
+                                    } else {
+                                        Some(canon.as_slice())
+                                    };
+                                    let snap_meta = WalletPipelineSnapshotMeta {
+                                        last_ingestion_run_id: cached
+                                            .ingestion
+                                            .as_ref()
+                                            .and_then(|i| i.run_id.clone()),
+                                        analytics_lane: cached
+                                            .data_lineage
+                                            .as_ref()
+                                            .map(|d| d.analytics_primary_source.clone())
+                                            .unwrap_or_else(|| "data_api_trades".to_string()),
+                                        cache_key: cache_key.clone(),
+                                        schema_version: cached.schema_version.clone(),
+                                        data_api_truncated: cached.data_fetch.truncated,
+                                        data_api_max_offset_allowed: cached
+                                            .data_fetch
+                                            .max_offset_allowed
+                                            .and_then(|x| i32::try_from(x).ok()),
+                                        data_api_trade_watermark_ms: merged
+                                            .iter()
+                                            .map(|t| trade_timestamp_ms(t.timestamp))
+                                            .max(),
+                                    };
+                                    if let Err(e) = store
+                                        .replace_wallet_pipeline_snapshots(
+                                            &w,
+                                            &snap_meta,
+                                            &merged,
+                                            &pnls,
+                                            canon_opt,
+                                            &cached,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "replace_wallet_pipeline_snapshots (cache-hit incremental): {e:#}"
+                                        );
+                                    } else {
+                                        refreshed_trades_on_hit = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !refreshed_trades_on_hit {
+                        if let Err(e) = store
+                            .refresh_wallet_snapshots_after_cache_hit(&w, &cache_key, &cached)
+                            .await
+                        {
+                            tracing::warn!("refresh_wallet_snapshots_after_cache_hit: {e:#}");
+                        }
+                    }
+                }
                 return Ok(cached);
             }
         }
@@ -497,7 +759,39 @@ async fn analyze_wallet(
     let rate = Duration::from_millis(cfg.rate_limit_ms);
     let data = DataApiClient::new(http.clone(), rate);
 
-    let trades_result = data.trades_all(wallet, cfg.trades_page_limit).await?;
+    let trades_result: TradesAllResult =
+        if cfg.ingestion.data_api_incremental_trades && storage.is_some() {
+            let store = storage.expect("incremental trades implies storage");
+            let prev = store
+                .fetch_wallet_primary_trades(&w)
+                .await
+                .unwrap_or_default();
+            if prev.is_empty() {
+                data.trades_all(wallet, cfg.trades_page_limit).await?
+            } else if let Some(wm) = wallet_trades_watermark_ms(&prev) {
+                let (delta, inc_trunc, max_off) = data
+                    .trades_since_watermark(
+                        wallet,
+                        cfg.trades_page_limit,
+                        wm,
+                        cfg.ingestion.data_api_incremental_max_pages,
+                    )
+                    .await?;
+                let delta_count = delta.len();
+                let merged = merge_trades_incremental(prev, delta);
+                TradesAllResult {
+                    trades: merged,
+                    truncated: inc_trunc,
+                    max_offset_allowed: max_off,
+                    fetched_incrementally: true,
+                    incremental_api_delta_count: delta_count,
+                }
+            } else {
+                data.trades_all(wallet, cfg.trades_page_limit).await?
+            }
+        } else {
+            data.trades_all(wallet, cfg.trades_page_limit).await?
+        };
 
     if let (Some(store), Some(rid)) = (storage, run_id) {
         let step = cfg.trades_page_limit.max(1) as usize;
@@ -515,6 +809,71 @@ async fn analyze_wallet(
             }
         }
     }
+
+    let gamma_timing = GammaApiClient::new(http.clone(), rate);
+    let gamma_timing_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
+    let resolution_ts_by_slug = fetch_resolution_times_for_trades(
+        &gamma_timing,
+        &trades_result.trades,
+        gamma_timing_cap,
+    )
+    .await;
+    let gamma_profile = match gamma_timing.public_profile_by_address(wallet).await {
+        Ok(p) => Some(GammaProfileSummary {
+            display_name: p.name.clone().or_else(|| p.pseudonym.clone()),
+            username: p.pseudonym.clone().or_else(|| p.x_username.clone()),
+            avatar_url: p.profile_image,
+        }),
+        Err(e) => {
+            tracing::debug!("gamma public-profile: {e:#}");
+            None
+        }
+    };
+
+    let pos_base = if cfg.ingestion.data_api_positions_limit > 0 {
+        cfg.ingestion.data_api_positions_limit
+    } else {
+        cfg.trades_page_limit
+    };
+    let pos_page = pos_base.clamp(10, 10_000);
+    let open_positions = data
+        .positions_all(wallet, pos_page)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("data-api /positions failed: {e:#}");
+            Vec::new()
+        });
+    let closed_positions = data
+        .closed_positions_all(wallet, pos_page)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("data-api /closed-positions failed: {e:#}");
+            Vec::new()
+        });
+
+    if let (Some(store), Some(rid)) = (storage, run_id) {
+        if cfg.ingestion.persist_positions_raw {
+            for (i, p) in open_positions.iter().enumerate() {
+                let row_payload = serde_json::to_value(p)?;
+                store
+                    .insert_raw_data_api_open_position(&rid, wallet, i as i32, &row_payload)
+                    .await?;
+            }
+            for (i, p) in closed_positions.iter().enumerate() {
+                let row_payload = serde_json::to_value(p)?;
+                store
+                    .insert_raw_data_api_closed_position(&rid, wallet, i as i32, &row_payload)
+                    .await?;
+            }
+        }
+    }
+
+    let augment = ReportAugment {
+        resolution_ts_by_slug,
+        open_positions,
+        closed_positions,
+        gamma_profile,
+    };
 
     let mut slug_by_condition: HashMap<String, String> = HashMap::new();
     for t in &trades_result.trades {
@@ -690,47 +1049,42 @@ async fn analyze_wallet(
         None
     };
 
-    let mut report = if cfg.analytics.source == "canonical" {
-        if let Some(ref artifacts) = merge_opt {
-            let synth = synthetic_trades_from_events(&artifacts.events, &slug_by_condition);
-            if synth.is_empty() {
+    let owned_synth: Option<Vec<Trade>> = if cfg.analytics.source == "canonical" {
+        merge_opt
+            .as_ref()
+            .map(|artifacts| synthetic_trades_from_events(&artifacts.events, &slug_by_condition))
+    } else {
+        None
+    };
+
+    let trades_for_report: &[Trade] = match &owned_synth {
+        Some(s) if !s.is_empty() => s.as_slice(),
+        _ => {
+            if cfg.analytics.source == "canonical" && merge_opt.is_some() {
                 tracing::warn!(
                     "analytics.source=canonical produced zero synthetic trades; falling back to data_api trades"
                 );
-                build_report(
-                    cfg,
-                    wallet,
-                    &trades_result.trades,
-                    trades_result.truncated,
-                    trades_result.max_offset_allowed,
-                )
-            } else {
-                build_report(
-                    cfg,
-                    wallet,
-                    &synth,
-                    trades_result.truncated,
-                    trades_result.max_offset_allowed,
-                )
             }
-        } else {
-            build_report(
-                cfg,
-                wallet,
-                &trades_result.trades,
-                trades_result.truncated,
-                trades_result.max_offset_allowed,
-            )
+            trades_result.trades.as_slice()
         }
-    } else {
-        build_report(
-            cfg,
-            wallet,
-            &trades_result.trades,
-            trades_result.truncated,
-            trades_result.max_offset_allowed,
-        )
     };
+
+    let mut report = build_report(
+        cfg,
+        wallet,
+        trades_for_report,
+        trades_result.truncated,
+        trades_result.max_offset_allowed,
+        &augment,
+    );
+
+    if trades_result.fetched_incrementally {
+        report.notes.push(format!(
+            "data_api_trades: incremental merge (api_new_rows≈{}, truncated={})",
+            trades_result.incremental_api_delta_count,
+            trades_result.truncated
+        ));
+    }
 
     let mut im = match ingest_meta.clone() {
         Some(m) => m,
@@ -914,6 +1268,45 @@ async fn analyze_wallet(
 
     if let Some(store) = storage {
         store.upsert_report(&cache_key, wallet, &report).await?;
+        let pnls = trade_pnl::per_trade_realized_pnl(trades_for_report);
+        store
+            .replace_wallet_trade_pnls(&cache_key, wallet, trades_for_report, &pnls)
+            .await?;
+        store
+            .upsert_leaderboard_row(wallet, &cache_key, &report)
+            .await?;
+
+        if cfg.ingestion.persist_wallet_snapshots {
+            let w = wallet.to_lowercase();
+            let snap_meta = WalletPipelineSnapshotMeta {
+                last_ingestion_run_id: run_id.map(|u| u.to_string()),
+                analytics_lane: analytics_src.to_string(),
+                cache_key: cache_key.clone(),
+                schema_version: report.schema_version.clone(),
+                data_api_truncated: trades_result.truncated,
+                data_api_max_offset_allowed: trades_result
+                    .max_offset_allowed
+                    .and_then(|x| i32::try_from(x).ok()),
+                data_api_trade_watermark_ms: trades_for_report
+                    .iter()
+                    .map(|t| trade_timestamp_ms(t.timestamp))
+                    .max(),
+            };
+            let canon_slice = merge_opt.as_ref().map(|m| m.events.as_slice());
+            if let Err(e) = store
+                .replace_wallet_pipeline_snapshots(
+                    &w,
+                    &snap_meta,
+                    trades_for_report,
+                    &pnls,
+                    canon_slice,
+                    &report,
+                )
+                .await
+            {
+                tracing::warn!("replace_wallet_pipeline_snapshots failed: {e:#}");
+            }
+        }
     }
 
     Ok(report)
@@ -994,11 +1387,13 @@ fn build_report(
     trades: &[Trade],
     truncated: bool,
     max_offset_allowed: Option<u32>,
+    augment: &ReportAugment,
 ) -> AnalyzeReport {
+    let per_trade_pnl = trade_pnl::per_trade_realized_pnl(trades);
     let mut total_volume = 0.0_f64;
     let mut net_pnl = 0.0_f64;
-    let mut max_single_win = 0.0_f64;
-    let mut max_single_loss = 0.0_f64;
+    let max_single_win;
+    let max_single_loss;
     let mut price_buckets: BTreeMap<String, usize> = BTreeMap::from([
         ("lt_0_1".to_string(), 0),
         ("0_1_to_0_3".to_string(), 0),
@@ -1026,12 +1421,6 @@ fn build_report(
             TradeSide::Sell => volume,
         };
         net_pnl += cash_flow;
-        if cash_flow > max_single_win {
-            max_single_win = cash_flow;
-        }
-        if cash_flow < max_single_loss {
-            max_single_loss = cash_flow;
-        }
 
         match t.side {
             TradeSide::Buy => buy_count += 1,
@@ -1046,12 +1435,7 @@ fn build_report(
             }
         }
 
-        let ts_ms = t.timestamp;
-        let ts_sec = if ts_ms > 1_000_000_000_000 {
-            ts_ms / 1000
-        } else {
-            ts_ms
-        };
+        let ts_sec = trade_ts_sec(t);
         if let Some(dt) = DateTime::from_timestamp(ts_sec, 0) {
             let hour = dt.with_timezone(&Utc).hour();
             *active_hours_utc.entry(hour).or_insert(0) += 1;
@@ -1087,6 +1471,19 @@ fn build_report(
         }
         w.1 += 1;
     }
+
+    max_single_win = per_trade_pnl
+        .iter()
+        .cloned()
+        .filter(|x| *x > 0.0)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0.0);
+    max_single_loss = per_trade_pnl
+        .iter()
+        .cloned()
+        .filter(|x| *x < 0.0)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0.0);
 
     let total_trades = trades.len().max(1);
     let total_volume_nonzero = if total_volume == 0.0 { 1.0 } else { total_volume };
@@ -1128,11 +1525,56 @@ fn build_report(
         })
         .collect();
 
+    let distinct_markets = trades_per_market.len().max(1);
+    let grid_ratio = grid_like_markets as f64 / distinct_markets as f64;
+
+    let mut entry_to_resolution_seconds: Vec<i64> = Vec::new();
+    for t in trades {
+        let te = trade_ts_sec(t);
+        if let Some(&res) = augment.resolution_ts_by_slug.get(&t.slug) {
+            let d = res - te;
+            if d > 0 && d < 86400 * 90 {
+                entry_to_resolution_seconds.push(d);
+            }
+        }
+    }
+    entry_to_resolution_seconds.sort_unstable();
+    let entry_p50 = percentile_i64_sorted(&entry_to_resolution_seconds, 0.5);
+    let entry_p90 = percentile_i64_sorted(&entry_to_resolution_seconds, 0.9);
+    let metadata_missing_ratio = if trades.is_empty() {
+        1.0
+    } else {
+        1.0 - (entry_to_resolution_seconds.len() as f64 / trades.len() as f64).clamp(0.0, 1.0)
+    };
+
     let time_analysis = TimeAnalysis {
         active_hours_utc,
-        entry_to_resolution_seconds: vec![],
+        entry_to_resolution_seconds: entry_to_resolution_seconds.clone(),
         holding_duration_seconds: vec![],
-        metadata_missing_ratio: 1.0,
+        metadata_missing_ratio,
+        entry_to_resolution_p50_sec: entry_p50,
+        entry_to_resolution_p90_sec: entry_p90,
+    };
+
+    let mut closed_wins = 0_usize;
+    let mut closed_n = 0_usize;
+    for c in &augment.closed_positions {
+        if let Some(r) = c.realized_pnl {
+            closed_n += 1;
+            if r > 0.0 {
+                closed_wins += 1;
+            }
+        }
+    }
+    let (win_rate_closed_positions, closed_positions_sample_size) = if closed_n >= 5 {
+        (
+            Some((closed_wins as f64 / closed_n as f64) * 100.0),
+            Some(closed_n),
+        )
+    } else if closed_n > 0 {
+        (None, Some(closed_n))
+    } else {
+        (None, None)
     };
 
     let trading_patterns = TradingPatterns {
@@ -1140,24 +1582,90 @@ fn build_report(
         side_bias,
         win_rate_overall,
         win_rate_by_market_type,
+        grid_like_market_ratio: Some(grid_ratio),
+        win_rate_closed_positions,
+        closed_positions_sample_size,
     };
 
-    let (primary_style, rule_json, pseudocode) = infer_strategy(
-        &market_distribution,
-        &trading_patterns,
-        &trading_patterns.side_bias,
+    let (primary_style, rule_json, pseudocode) = strategy::infer_strategy(StrategyInputs {
+        market_distribution: &market_distribution,
+        patterns: &trading_patterns,
+        side_bias: &trading_patterns.side_bias,
         total_volume,
-        trades.len(),
-    );
+        trades_count: trades.len(),
+        trades,
+        resolution_ts_by_slug: &augment.resolution_ts_by_slug,
+    });
 
     let strategy_inference = StrategyInference {
-        primary_style,
+        primary_style: primary_style.clone(),
         rule_json,
         pseudocode,
     };
 
+    let price_buckets_chart = Some(vec![
+        NormalizedPriceBucket {
+            label: "<0.1".into(),
+            range_low: 0.0,
+            range_high: 0.1,
+            count: *price_buckets.get("lt_0_1").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.1–0.3".into(),
+            range_low: 0.1,
+            range_high: 0.3,
+            count: *price_buckets.get("0_1_to_0_3").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.3–0.5".into(),
+            range_low: 0.3,
+            range_high: 0.5,
+            count: *price_buckets.get("0_3_to_0_5").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.5–0.7".into(),
+            range_low: 0.5,
+            range_high: 0.7,
+            count: *price_buckets.get("0_5_to_0_7").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.7–0.9".into(),
+            range_low: 0.7,
+            range_high: 0.9,
+            count: *price_buckets.get("0_7_to_0_9").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "≥0.9".into(),
+            range_low: 0.9,
+            range_high: 1.0,
+            count: *price_buckets.get("gt_0_9").unwrap_or(&0),
+        },
+    ]);
+
+    let frontend = Some(build_frontend_presentation(
+        wallet,
+        trades,
+        &per_trade_pnl,
+        &augment.open_positions,
+        &primary_style,
+        win_rate_overall,
+        total_volume,
+    ));
+
+    let open_position_value: f64 = augment
+        .open_positions
+        .iter()
+        .filter_map(|p| p.current_value)
+        .sum();
+    let closed_realized_pnl_sum: f64 = augment
+        .closed_positions
+        .iter()
+        .filter_map(|p| p.realized_pnl)
+        .sum();
+    let open_positions_count = augment.open_positions.len();
+
     AnalyzeReport {
-        schema_version: "2.0.0".to_string(),
+        schema_version: "2.2.0".to_string(),
         wallet: wallet.to_string(),
         trades_count: trades.len(),
         total_volume,
@@ -1169,9 +1677,19 @@ fn build_report(
             total_trades: trades.len(),
             total_volume,
             net_pnl,
-            open_position_value: 0.0,
+            open_position_value,
             max_single_win,
             max_single_loss,
+            closed_realized_pnl_sum: if augment.closed_positions.is_empty() {
+                None
+            } else {
+                Some(closed_realized_pnl_sum)
+            },
+            open_positions_count: if open_positions_count == 0 {
+                None
+            } else {
+                Some(open_positions_count)
+            },
         },
         market_distribution,
         price_buckets,
@@ -1186,10 +1704,12 @@ fn build_report(
         data_lineage: None,
         provenance: None,
         metrics_canonical_shadow: None,
+        price_buckets_chart,
+        frontend,
+        gamma_profile: augment.gamma_profile.clone(),
         notes: {
             let mut notes = vec![
-            "PnL and win-rate are trade-level (cash flow); position reconstruction and Gamma metadata for entry/holding time next."
-                .to_string(),
+                "net_pnl: per-trade cash flow; closed_realized_pnl_sum from /closed-positions; open_position_value from /positions; entry P50/P90 use Gamma resolution times (capped slugs).".into(),
             ];
             if truncated {
                 notes.push(format!(
@@ -1204,64 +1724,15 @@ fn build_report(
     }
 }
 
-fn infer_strategy(
-    market_dist: &[MarketDistributionItem],
-    patterns: &TradingPatterns,
-    side_bias: &SideBias,
-    total_volume: f64,
-    trades_count: usize,
-) -> (String, serde_json::Value, String) {
-    let top_type = market_dist
-        .first()
-        .map(|m| m.market_type.as_str())
-        .unwrap_or("unknown");
-    let is_grid = patterns.grid_like_markets > 0;
-    let high_freq = trades_count >= 50;
-    let primary_style = match (top_type, is_grid, high_freq) {
-        (t, true, true) if t.contains("5-min") || t.contains("1h") => {
-            "high_frequency_scalper".to_string()
-        }
-        (_, true, _) => "grid_bot".to_string(),
-        (t, _, _) if t == "politics" || t == "event" || t == "unknown" => {
-            "long_hold_event_bettor".to_string()
-        }
-        (t, _, _) if t.contains("daily") || t.contains("1h") => "momentum_trader".to_string(),
-        _ => "mixed".to_string(),
-    };
-
-    let preferred_low = if side_bias.buy_pct > 60.0 { 0.3 } else { 0.0 };
-    let preferred_high = if side_bias.sell_pct > 60.0 { 0.7 } else { 1.0 };
-    let rule_json = serde_json::json!({
-        "entry_window_sec": null,
-        "preferred_price_range": [preferred_low, preferred_high],
-        "multi_entry_markets": patterns.grid_like_markets,
-        "side_bias": { "buy_pct": side_bias.buy_pct, "sell_pct": side_bias.sell_pct },
-        "primary_market_type": top_type,
-        "total_volume": total_volume,
-        "trades_count": trades_count,
-    });
-
-    let pseudocode = format!(
-        "FOR each market in top_types:\n  IF market matches {}:\n    ENTRY: prefer price in [{}, {}]\n    SIDE_BIAS: buy {}% / sell {}%\n  IF multi_entry_markets > 0: GRID-like behavior (same market >3 trades)\n  STYLE: {}",
-        top_type,
-        preferred_low,
-        preferred_high,
-        side_bias.buy_pct as i32,
-        side_bias.sell_pct as i32,
-        primary_style
-    );
-
-    (primary_style, rule_json, pseudocode)
-}
-
 async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
     use axum::{
-        extract::{Path, Query},
-        http::StatusCode,
+        extract::{Path, Query, State},
+        http::{HeaderValue, Method, StatusCode},
         response::IntoResponse,
         routing::get,
         Json, Router,
     };
+    use tower_http::cors::{Any, CorsLayer};
 
     let storage = init_storage(&cfg).await?;
 
@@ -1279,7 +1750,7 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
     async fn analyze_handler(
         Path(wallet): Path<String>,
         Query(q): Query<AnalyzeQuery>,
-        axum::extract::State(st): axum::extract::State<AppState>,
+        State(st): State<AppState>,
     ) -> impl IntoResponse {
         let cfg = effective_config(&st.cfg, &AnalyzeOverrides::from(&q));
         match analyze_wallet(&cfg, st.storage.as_ref(), &wallet, q.no_cache).await {
@@ -1294,12 +1765,57 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         }
     }
 
-    let app = Router::new()
+    async fn leaderboard_handler(
+        Query(q): Query<LeaderboardQuery>,
+        State(st): State<AppState>,
+    ) -> impl IntoResponse {
+        let limit = q.limit.unwrap_or(30).clamp(1, 100);
+        let Some(ref store) = st.storage else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "leaderboard requires postgres (DATABASE_URL)"
+                })),
+            )
+                .into_response();
+        };
+        match store.fetch_leaderboard(limit).await {
+            Ok(rows) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "items": rows })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{:#}", e) })),
+            )
+                .into_response(),
+        }
+    }
+
+    let mut app = Router::new()
         .route("/analyze/:wallet", get(analyze_handler))
+        .route("/leaderboard", get(leaderboard_handler))
         .with_state(state);
 
+    let cors_origins: Vec<HeaderValue> = cfg
+        .cors_allowed_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<HeaderValue>().ok())
+        .collect();
+
+    if !cors_origins.is_empty() {
+        let layer = CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(cors_origins))
+            .allow_methods([Method::GET, Method::OPTIONS])
+            .allow_headers(Any);
+        app = app.layer(layer);
+    }
+
+    tracing::info!("listening on {}", bind.as_str());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!("listening on {}", bind);
     axum::serve(listener, app).await?;
     Ok(())
 }

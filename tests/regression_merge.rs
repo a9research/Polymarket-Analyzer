@@ -76,7 +76,14 @@ fn report_cache_fingerprint_includes_reconciliation_quality() {
     let recon = v.get("reconciliation").expect("reconciliation");
     assert!(recon.get("shadow_volume_alert_ratio").is_some());
     assert!(recon.get("api_only_ratio_alert").is_some());
-    assert!(v.get("ingestion").and_then(|x| x.get("persist_raw")).is_some());
+    let ing = v.get("ingestion").expect("ingestion");
+    assert!(ing.get("persist_raw").is_some());
+    assert!(ing.get("max_gamma_slugs_for_timing").is_some());
+    assert!(ing.get("data_api_positions_limit").is_some());
+    assert!(ing.get("persist_positions_raw").is_some());
+    assert!(ing.get("persist_wallet_snapshots").is_some());
+    assert!(ing.get("data_api_incremental_trades").is_some());
+    assert!(ing.get("data_api_incremental_max_pages").is_some());
 }
 
 #[test]

@@ -76,6 +76,11 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub analytics: AnalyticsConfig,
+
+    /// Comma-separated `Origin` values allowed for browser CORS on `serve`, e.g.
+    /// `https://stats.example.com,http://localhost:3000`. Empty = no CORS middleware.
+    #[serde(default)]
+    pub cors_allowed_origins: String,
 }
 
 fn default_trades_page_limit() -> u32 {
@@ -251,17 +256,49 @@ impl Default for ReconciliationConfig {
     }
 }
 
+fn default_max_gamma_slugs_for_timing() -> u32 {
+    150
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestionConfig {
     /// Persist raw chunks to Postgres when database is configured.
     #[serde(default = "default_true")]
     pub persist_raw: bool,
+    /// Max distinct slugs to call Gamma `markets/slug` for entry-to-resolution timing; **0 = skip** (no Gamma timing calls).
+    #[serde(default = "default_max_gamma_slugs_for_timing")]
+    pub max_gamma_slugs_for_timing: u32,
+    /// Page size for Data API `/positions` and `/closed-positions` pagination; **0 = use `trades_page_limit`**.
+    #[serde(default)]
+    pub data_api_positions_limit: u32,
+    /// When `persist_raw`, also write `raw_data_api_open_positions` / `raw_data_api_closed_positions`.
+    #[serde(default = "default_true")]
+    pub persist_positions_raw: bool,
+    /// Wallet-scoped **latest** pipeline snapshots (normalized trades, optional canonical rows, reconciliation, frontend, strategy, full report) for SQL/BI — see `artifacts/wallet-pipeline-snapshot.md`.
+    #[serde(default = "default_true")]
+    pub persist_wallet_snapshots: bool,
+    /// When true and Postgres has `wallet_primary_trade_row` for this wallet, fetch only trades **newer than** the stored watermark (see `data_api::trades_since_watermark`). **false** = always full `/trades` pagination.
+    #[serde(default = "default_true")]
+    pub data_api_incremental_trades: bool,
+    /// Max `/trades` pages per incremental run (page size = `trades_page_limit`).
+    #[serde(default = "default_data_api_incremental_max_pages")]
+    pub data_api_incremental_max_pages: u32,
+}
+
+fn default_data_api_incremental_max_pages() -> u32 {
+    250
 }
 
 impl Default for IngestionConfig {
     fn default() -> Self {
         Self {
             persist_raw: true,
+            max_gamma_slugs_for_timing: default_max_gamma_slugs_for_timing(),
+            data_api_positions_limit: 0,
+            persist_positions_raw: true,
+            persist_wallet_snapshots: true,
+            data_api_incremental_trades: true,
+            data_api_incremental_max_pages: default_data_api_incremental_max_pages(),
         }
     }
 }
@@ -280,6 +317,7 @@ impl Default for AppConfig {
             ingestion: IngestionConfig::default(),
             canonical: CanonicalConfig::default(),
             analytics: AnalyticsConfig::default(),
+            cors_allowed_origins: String::new(),
         }
     }
 }
@@ -459,6 +497,38 @@ pub fn apply_env_overrides(cfg: &mut AppConfig) {
             cfg.ingestion.persist_raw = b;
         }
     }
+    if let Ok(v) = std::env::var("PAA_MAX_GAMMA_SLUGS_TIMING") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            cfg.ingestion.max_gamma_slugs_for_timing = n;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_DATA_API_POSITIONS_LIMIT") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            cfg.ingestion.data_api_positions_limit = n;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_PERSIST_POSITIONS_RAW") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.ingestion.persist_positions_raw = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_PERSIST_WALLET_SNAPSHOTS") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.ingestion.persist_wallet_snapshots = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_DATA_API_INCREMENTAL_TRADES") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.ingestion.data_api_incremental_trades = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_DATA_API_INCREMENTAL_MAX_PAGES") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            if n > 0 {
+                cfg.ingestion.data_api_incremental_max_pages = n;
+            }
+        }
+    }
     if let Ok(v) = std::env::var("PAA_ANALYTICS_SOURCE") {
         let s = v.trim();
         if s == "data_api" || s == "canonical" {
@@ -473,6 +543,12 @@ pub fn apply_env_overrides(cfg: &mut AppConfig) {
     if let Ok(v) = std::env::var("PAA_ENRICH_MARKETS_DIM") {
         if let Some(b) = parse_env_bool(&v) {
             cfg.canonical.enrich_markets_dim = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_CORS_ORIGINS") {
+        let t = v.trim();
+        if !t.is_empty() {
+            cfg.cors_allowed_origins = t.to_string();
         }
     }
 }
@@ -511,6 +587,11 @@ impl Merge for AppConfig {
             ingestion: other.ingestion,
             canonical: other.canonical,
             analytics: other.analytics,
+            cors_allowed_origins: if other.cors_allowed_origins.is_empty() {
+                self.cors_allowed_origins
+            } else {
+                other.cors_allowed_origins
+            },
         }
     }
 }
@@ -545,6 +626,12 @@ pub fn report_cache_fingerprint_value(cfg: &AppConfig) -> serde_json::Value {
         "trades_page_limit": cfg.trades_page_limit,
         "ingestion": {
             "persist_raw": cfg.ingestion.persist_raw,
+            "max_gamma_slugs_for_timing": cfg.ingestion.max_gamma_slugs_for_timing,
+            "data_api_positions_limit": cfg.ingestion.data_api_positions_limit,
+            "persist_positions_raw": cfg.ingestion.persist_positions_raw,
+            "persist_wallet_snapshots": cfg.ingestion.persist_wallet_snapshots,
+            "data_api_incremental_trades": cfg.ingestion.data_api_incremental_trades,
+            "data_api_incremental_max_pages": cfg.ingestion.data_api_incremental_max_pages,
         },
         "analytics": {
             "source": cfg.analytics.source,

@@ -121,6 +121,63 @@ pub struct IngestionMeta {
     pub truncation: Option<IngestionTruncation>,
 }
 
+/// Fixed price bands for dashboards (`<0.1`, `0.1–0.3`, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedPriceBucket {
+    pub label: String,
+    pub range_low: f64,
+    pub range_high: f64,
+    pub count: usize,
+}
+
+/// Compact row for UI / LLM prompts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeHighlight {
+    pub slug: String,
+    pub side: String,
+    pub price: f64,
+    pub size: f64,
+    /// Realized PnL on this fill (average-cost model); **0** on buys.
+    #[serde(default)]
+    pub pnl: f64,
+    pub cash_flow: f64,
+    pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionRowDisplay {
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub outcome: Option<String>,
+    pub size: Option<f64>,
+    pub avg_price: Option<f64>,
+    pub cur_price: Option<f64>,
+    pub cash_pnl: Option<f64>,
+    pub current_value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FrontendPresentation {
+    pub biggest_wins: Vec<TradeHighlight>,
+    pub biggest_losses: Vec<TradeHighlight>,
+    pub recent_trades: Vec<TradeHighlight>,
+    pub current_positions: Vec<PositionRowDisplay>,
+    /// One-shot text for pasting into an LLM as wallet context.
+    pub ai_copy_prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GammaProfileSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzeReport {
     #[serde(default = "default_schema_version")]
@@ -159,6 +216,13 @@ pub struct AnalyzeReport {
     /// When canonical merge ran and `analytics.canonical_shadow`, compares to primary metrics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_canonical_shadow: Option<CanonicalShadowMetrics>,
+    /// Same buckets as `price_buckets` with human labels for charts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_buckets_chart: Option<Vec<NormalizedPriceBucket>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<FrontendPresentation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamma_profile: Option<GammaProfileSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -175,10 +239,18 @@ pub struct DataFetchMeta {
 pub struct LifetimeMetrics {
     pub total_trades: usize,
     pub total_volume: f64,
+    /// Trade-level cash-flow sum (buys negative, sells positive); not full portfolio accounting.
     pub net_pnl: f64,
+    /// Sum of `currentValue` from Data API open positions when available.
     pub open_position_value: f64,
     pub max_single_win: f64,
     pub max_single_loss: f64,
+    /// Sum of `realizedPnl` from `/closed-positions` when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_realized_pnl_sum: Option<f64>,
+    /// Count of open rows from `/positions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_positions_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,14 +269,29 @@ pub struct TimeAnalysis {
     pub entry_to_resolution_seconds: Vec<i64>,
     pub holding_duration_seconds: Vec<i64>,
     pub metadata_missing_ratio: f64,
+    /// P50 seconds from trade time to market resolution (Gamma end/close), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_to_resolution_p50_sec: Option<f64>,
+    /// P90 seconds from trade time to resolution; **< 60** often indicates last-minute / degen entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_to_resolution_p90_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradingPatterns {
     pub grid_like_markets: usize,
     pub side_bias: SideBias,
+    /// Win rate from per-trade cash flow (same as before).
     pub win_rate_overall: f64,
     pub win_rate_by_market_type: Vec<WinRateByMarketType>,
+    /// Fraction of distinct markets with >3 trades (grid-like), **0–1**.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_like_market_ratio: Option<f64>,
+    /// Win rate from closed positions (`realizedPnl > 0`) when enough samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub win_rate_closed_positions: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_positions_sample_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,4 +314,3 @@ pub struct StrategyInference {
     pub rule_json: serde_json::Value,
     pub pseudocode: String,
 }
-

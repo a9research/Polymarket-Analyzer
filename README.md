@@ -220,9 +220,16 @@ cargo run --release -- --config config.toml serve --bind 127.0.0.1:3000
 | **`PAA_RECONCILIATION_ENABLED`** | 是否在默认流程里做 **Data API 与子图（及 canonical）之间的对账摘要**（v0/v1 逻辑由是否开 canonical 等决定）。 |
 | **`PAA_CANONICAL_ENABLED`** | 是否做 **规范层合并**并把结果**写入 Postgres**（`canonical_events` 等）。依赖 **已配置数据库** 且一般与 **raw 落库**一起用；用于可追溯、PG 重放报告等。 |
 | **`PAA_PERSIST_RAW`** | 是否在分析跑批时把 **原始 API/子图块** 写入 **`raw_*` 表**。关则只做报告（若开了缓存仍有 `report_cache`），**不做行级 raw 审计**。 |
+| **`PAA_MAX_GAMMA_SLUGS_TIMING`** | **`[ingestion].max_gamma_slugs_for_timing`**：Gamma `markets/slug` 去重后最多请求多少 slug（用于 entry→resolution 计时）。**`0`** = 不调 Gamma、跳过该计时。 |
+| **`PAA_DATA_API_POSITIONS_LIMIT`** | **`[ingestion].data_api_positions_limit`**：`/positions`、`/closed-positions` 每页 limit；**`0`** = 使用 **`trades_page_limit`**。 |
+| **`PAA_PERSIST_POSITIONS_RAW`** | **`[ingestion].persist_positions_raw`**：`persist_raw` 时是否写入 **`raw_data_api_open_positions`** / **`raw_data_api_closed_positions`**。 |
+| **`PAA_PERSIST_WALLET_SNAPSHOTS`** | **`[ingestion].persist_wallet_snapshots`**：是否在每次完整 **`analyze`** 后写入 **`wallet_*`** 表（主交易行、canonical 行、对账/前端/策略/整份报告快照）。 |
+| **`PAA_DATA_API_INCREMENTAL_TRADES`** | **`[ingestion].data_api_incremental_trades`**：是否在 PG 已有 `wallet_primary_trade_row` 时对 `/trades` **按水位增量拉取并合并**（见 `artifacts/wallet-pipeline-snapshot.md`）。 |
+| **`PAA_DATA_API_INCREMENTAL_MAX_PAGES`** | **`[ingestion].data_api_incremental_max_pages`**：增量模式最多翻页数（每页 = `trades_page_limit`）。 |
 | **`PAA_ANALYTICS_SOURCE`** | **主报告指标**（lifetime、分布、策略反推等）基于哪条「成交流」：**`data_api`** = 直接用 Data API 成交；**`canonical`** = 优先用内存合并后的合成成交（没有则回退 Data API）。 |
 | **`PAA_ANALYTICS_CANONICAL_SHADOW`** | 是否在算主指标的同时**也算一套 canonical 影子指标**（`metrics_canonical_shadow`），用于**对比 Data API 与合并视图**、在报告 notes 里提示差异。 |
 | **`PAA_ENRICH_MARKETS_DIM`** | 是否用 **Gamma** 把市场里出现的 slug **补进 `markets_dim` 维表**（便于后续分析与展示）。需要外网访问 Gamma。 |
+| **`PAA_CORS_ORIGINS`** | 同 TOML **`cors_allowed_origins`**：Vercel 等前端**跨域**访问 **`serve`** 时必填（逗号分隔多个 Origin）。 |
 
 **尚未通过 `PAA_*` 暴露的**（仍需 TOML）：`[market_type]` 规则、`[reconciliation]` 里容差/阈值、`[subgraph]` 超时/重试秒数等 —— 需要时用 **`--config` + 挂载文件**。
 
@@ -437,7 +444,16 @@ cargo run --release -- report-from-canonical-run "550e8400-..." --out replay.jso
 
 ## HTTP API
 
-**路由：** `GET /analyze/:wallet`（`wallet` 为路径参数，**不要**对 `0x` 地址再做一层 URL 编码破坏路径，一般直接写即可）。
+**路由：**
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | **`/analyze/:wallet`** | 完整 `AnalyzeReport` JSON |
+| `GET` | **`/leaderboard`** | 首页榜单（需 **Postgres**）；Query：`limit` 默认 30，范围 1～100 |
+
+**CORS（浏览器直连 VPS）：** 配置顶层 **`cors_allowed_origins`**（逗号分隔），或环境变量 **`PAA_CORS_ORIGINS`**（例如 `https://stats.example.com,http://localhost:3000`）。为空则**不**挂载 CORS 中间件。
+
+`GET /analyze/:wallet`：`wallet` 为路径参数，**不要**对 `0x` 地址再做一层 URL 编码破坏路径，一般直接写即可。
 
 **Query 参数**（与 `Analyze` CLI 覆盖一致，均为可选；布尔值常用 `true` / `false`）：
 
@@ -455,6 +471,7 @@ curl -s "http://127.0.0.1:3000/analyze/0x5924ca480d8b08cd5f3e5811fa378c4082475af
 curl -s "http://127.0.0.1:3000/analyze/0x...?no_cache=true" | jq .
 curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&with_reconciliation=true" | jq .
 curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_rows=500" | jq .
+curl -s "http://127.0.0.1:3000/leaderboard?limit=20" | jq .
 ```
 
 > **说明：** 当前 **没有** 与 `report-from-canonical-run`、`export-ambiguous`、`set-ambiguous-review` 等价的 HTTP 接口；这些仅 CLI。
@@ -476,6 +493,7 @@ curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_row
 | `timeout_sec` | Data API / Gamma HTTP 超时（秒） | 90 |
 | `trades_page_limit` | Data API 分页 | 500 |
 | `rate_limit_ms` | Data API 请求间隔 | 150 |
+| `cors_allowed_origins` | `serve` 时允许的浏览器 `Origin`（逗号分隔）；空 = 不启用 CORS | 空 |
 
 ### 各配置块
 
@@ -484,7 +502,7 @@ curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_row
 | **`[subgraph]`** | 子图 URL、`enabled`、**分页与封顶**、超时/重试、`extended_fill_fields`、`show_progress`、`user_agent` 等 |
 | **`[reconciliation]`** | `enabled`、v0 时间窗、v1 **`size_tolerance_pct` / `price_tolerance_abs` / `require_condition_match` / `rules_version`**、质量阈值 **`shadow_volume_alert_ratio`、`api_only_ratio_alert`、`api_only_alert_min`** |
 | **`[analytics]`** | **`source`**: `data_api`（默认）或 **`canonical`**（合成成交驱动主指标，空则回退 Data API）；**`canonical_shadow`**：算 shadow 与 `metrics_canonical_shadow` |
-| **`[ingestion]`** | **`persist_raw`**：是否写 `ingestion_run` / `raw_*` |
+| **`[ingestion]`** | **`persist_raw`**；**`max_gamma_slugs_for_timing`**；**`data_api_positions_limit`**；**`persist_positions_raw`**；**`persist_wallet_snapshots`**；**`data_api_incremental_trades`** / **`data_api_incremental_max_pages`**（**`wallet_*`** 与增量说明见 [`artifacts/wallet-pipeline-snapshot.md`](../artifacts/wallet-pipeline-snapshot.md)） |
 | **`[canonical]`** | **`enabled`**：规范合并 + `canonical_events` 等落库；**`enrich_markets_dim`**：Gamma 补市场维表 |
 | **`[market_type]`** | 按 slug 归类市场类型：**规则有序，首条命中生效**；支持 **`contains`** / **`prefix`**（见 `config.rs` / 示例文件） |
 
@@ -494,7 +512,7 @@ curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_row
 
 启用 Postgres 时，同一钱包的报告可能来自 **`report_cache_kv`**。缓存键由 **钱包（小写）+ 配置指纹哈希** 组成，指纹包含例如：
 
-`trades_page_limit`、`subgraph`（enabled、cap、page_size、max_pages、positions_page_size、skip_pnl、extended_fill_fields）、`canonical`、`reconciliation` 各字段、`ingestion.persist_raw`、`analytics` 等。
+`trades_page_limit`、`subgraph`（enabled、cap、page_size、max_pages、positions_page_size、skip_pnl、extended_fill_fields）、`canonical`、`reconciliation` 各字段、`ingestion`（含 **`persist_raw`、`max_gamma_slugs_for_timing`、`data_api_positions_limit`、`persist_positions_raw`、`persist_wallet_snapshots`、`data_api_incremental_trades`、`data_api_incremental_max_pages`**）、`analytics` 等。
 
 **修改上述任一字段** 后若仍命中旧缓存，请使用 **`--no-cache`** 或 **`?no_cache=true`**。  
 **`--subgraph-cap-rows` / `subgraph_cap_rows`** 会改变 `cap_rows_per_stream`，同样影响指纹。
@@ -527,9 +545,19 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-`schema_version: "2.0.0"`，主要字段包括：
+当前发布 **`schema_version: "2.2.0"`**（旧缓存可能仍为 `2.1.0` / `2.0.0`）。在 2.1 基础上新增 / 强化：
 
-`wallet`、`trades_count`、`total_volume`、`lifetime`、`market_distribution`、`price_buckets`、`time_analysis`、`trading_patterns`、`strategy_inference`、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。
+| 块 | 说明 |
+|----|------|
+| **`lifetime`** | `net_pnl` / `total_volume` / `total_trades` 等；**`max_single_win` / `max_single_loss`**（2.2+）为单笔**已实现 `pnl`** 极值；另含 `open_position_value`、**`closed_realized_pnl_sum`**、**`open_positions_count`** |
+| **`time_analysis`** | **`entry_to_resolution_seconds`**（有 Gamma 解析时填充）、**`entry_to_resolution_p50_sec` / `p90_sec`**、`metadata_missing_ratio` 按样本比例更新 |
+| **`trading_patterns`** | **`grid_like_market_ratio`**、**`win_rate_closed_positions`**（样本 ≥5 时）、**`closed_positions_sample_size`** |
+| **`strategy_inference`** | `src/strategy.rs`：**`high-frequency-grid-scalper`**（网格占比 >20% 且 entry P90 < 60s 等）；**`rule_json`** 含 `entry_window_sec_avg`、`preferred_price_ranges`、`jackpot_bias`、`multi_window_count` 等；更长的 **pseudocode** |
+| **`price_buckets_chart`** | 固定区间 + `label`（`<0.1`、`0.1–0.3`…），便于前端图表轴一致 |
+| **`frontend`** | **`biggest_wins` / `biggest_losses`**（按 **`pnl`** 排序：单笔**已实现**盈亏，平均成本法；买为 0）、**`recent_trades`**、**`current_positions`**、**`ai_copy_prompt`** |
+| **`gamma_profile`** | Gamma **`/public-profile`**：`display_name`、`username`、`avatar_url`（有则填） |
+
+仍包含：`wallet`、`trades_count`、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`（原字段）、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。
 
 ---
 
@@ -540,9 +568,11 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 | 类别 | 表 |
 |------|-----|
 | 报告缓存 | **`report_cache_kv`**（主）；`analyze_report_cache`（仅 legacy 读） |
-| 任务与 Raw | `ingestion_run`、`raw_ingestion_chunk`、`raw_data_api_trades`、`raw_subgraph_*` |
+| 前端 / 榜单 | **`wallet_trade_pnl`**（每笔 `pnl` + 成交字段，按 `cache_key` 覆盖写入）；**`wallet_leaderboard_stats`**（按 `lifetime.net_pnl` 排名，每次 analyze 写缓存时 upsert） |
+| 任务与 Raw | `ingestion_run`、`raw_ingestion_chunk`、`raw_data_api_trades`、**`raw_data_api_open_positions`**、**`raw_data_api_closed_positions`**、`raw_subgraph_*` |
 | 维表 | `markets_dim` |
 | 规范与对账 | `canonical_events`、`source_event_map`、`reconciliation_report`、`reconciliation_ambiguous_queue` |
+| Wallet 最新快照（BI / 分步） | **`wallet_pipeline_meta`**、**`wallet_primary_trade_row`**、**`wallet_canonical_event_row`**、**`wallet_reconciliation_current`**、**`wallet_frontend_current`**、**`wallet_strategy_current`**、**`wallet_report_snapshot`**（见 **`artifacts/wallet-pipeline-snapshot.md`**） |
 
 ---
 
@@ -600,6 +630,7 @@ cargo build --release
 | [**`artifacts/raw-ingestion-contract.md`**](../artifacts/raw-ingestion-contract.md) | 外部管道与 raw 表契约（P3） |
 | [**`artifacts/manual-test-checklist.md`**](../artifacts/manual-test-checklist.md) | 手工测试清单 |
 | [**`artifacts/progress-log.md`**](../artifacts/progress-log.md) | 按日迭代与验证记录 |
+| [**`artifacts/backlog-waiting.md`**](../artifacts/backlog-waiting.md) | **待解决 / 按需开发**（增量假设、缓存与行表一致性、后续能力） |
 | [`task_plan.md`](../task_plan.md)、[`findings.md`](../findings.md)、[`progress.md`](../progress.md) | 任务、决策、进度摘要 |
 
 ---
