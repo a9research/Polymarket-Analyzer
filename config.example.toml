@@ -1,31 +1,32 @@
-# Default request spacing between upstream API calls (milliseconds)
+# --- 顶层：Data API 节奏与分页（详见 README「数据量与分页」）---
+# 两次 Data API 请求之间的间隔（毫秒）
 rate_limit_ms = 150
 
-# Trades page size for GET /trades (same as offset step). Example: 3000 => usually 2 requests up to max offset 3000.
+# GET /trades 的 limit，同时也是 offset 步长；最大 10000；默认 500（代码内）
 # trades_page_limit = 3000
 
-# HTTP timeout for Data API / Gamma (seconds)
+# Data API / Gamma HTTP 超时（秒）
 # timeout_sec = 90
 
-# Cache TTL in seconds
+# 报告缓存 TTL（秒）
 cache_ttl_sec = 600
 
-# Optional: can also be provided by env var DATABASE_URL
+# Postgres：若此处留空/删除，则使用环境变量 DATABASE_URL；若两者都有，以本文件为准
 database_url = "postgres://postgres:postgres@localhost:5432/polymarket_analyzer"
 
-# --- Subgraph (Goldsky GraphQL), merged into `analyze` / `serve` when enabled ---
+# --- Subgraph（Goldsky）；enabled 或 CLI/API --with-subgraph 时参与 analyze ---
 [subgraph]
-# Default false; enable with `enabled = true` or CLI/API `--with-subgraph`
+# 默认 false；改为 true 或与 --with-subgraph 联用
 enabled = false
-# activity_url / orderbook_url / pnl_url use built-in Goldsky defaults if omitted
-# page_size = 1000
-# max_pages = 500
-# positions_page_size = 100
-# skip_pnl_positions = false
+# 省略 activity_url / orderbook_url / pnl_url 时使用内置 Goldsky 默认端点
+# page_size = 1000              # 每页条数（默认 1000）
+# max_pages = 500               # 每流最多翻页数（默认 500）
+# positions_page_size = 100     # PnL 持仓分页（默认 100）
+# skip_pnl_positions = false    # true 可跳过 PnL 仓位拉取以省时间
 # timeout_sec = 600
 # max_retries = 5
 # pnl_max_retries = 8
-# cap_rows_per_stream = 0   # 0 = no cap; use e.g. 1000 for smoke tests
+# cap_rows_per_stream = 0       # 每条子图流最多保留行数；0=不限制；冒烟可设 1000
 # show_progress = true
 # user_agent = "polymarket-account-analyzer/0.2 (subgraph)"
 # Request extra orderFilledEvent fields (tx hash, condition, size, price); auto-falls back if subgraph rejects.
