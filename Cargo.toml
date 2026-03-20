@@ -8,6 +8,7 @@ anyhow = "1"
 axum = { version = "0.7", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

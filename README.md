@@ -111,14 +111,19 @@ cargo run --example subgraph_spike -- --out subgraph_spike.json 0xYourWallet...
 cargo run --example subgraph_spike -- --out subgraph_spike.json --tee 0xYourWallet...
 
 # 全量分页（默认）：Activity / Orderbook 用 first+skip；PnL userPositions 用 id 游标（id_gt），避免深 skip 触发托管库 statement timeout
-# 可调：--page-size（1..=1000）、--max-pages（安全上限，默认 500）
+# 可调：--page-size（1..=1000）、--max-pages（安全上限，默认 500）、--positions-page-size（仅 userPositions，默认 100，大账户可调小如 50）
 cargo run --example subgraph_spike -- --out full.json 0xYourWallet...
 
 # 只要赎回 + 成交、不要 PnL 子图的 userPositions
 cargo run --example subgraph_spike -- --skip-pnl-positions --out full.json 0xYourWallet...
 ```
 
-全量模式 HTTP 超时约 **300s**；GraphQL 对 timeout / 429 等会做 **最多 3 次**指数退避重试。合并 JSON 里 `_spike_pagination.pagination`：`skip`（redemptions / fills）或 `cursor_id_gt`（userPositions）。
+- 全量模式单次 HTTP 超时约 **600s**；一般请求 **最多 5 次**退避重试；**PnL `userPositions` 为 8 次**（单页查询更重）。
+- **进度**：终端显示 **spinner + 文案**（当前段、第几页、累计行数）；`--no-progress` 可关（适合 CI/重定向日志）。
+- **边写文件**：指定 `--out` 时，每完成一大段（redemptions / maker / taker / PnL 或跳过）都会 **原子覆盖写入** 同一路径，中途崩溃也能保留已拉完段落。可选 `--flush-every-pages N`（`N>0`）在**每一段内**每 N 页再写一次（大 JSON 会很慢，仅建议断点续跑需求）。
+- 合并 JSON 里 `_spike_pagination.pagination`：`skip`（redemptions / fills）或 `cursor_id_gt`（userPositions）。进行中刷新时 `stopped_because` 可能为 **`in_progress`**。
+- **`stopped_because: max_pages`** 表示触顶：`total_rows` 约为 `max_pages × page_size`（默认最多 **500000** 行/流），不是链上必然的全量；要更多可调大 `--max-pages`（注意内存与体积）。
+- 若 **PnL 段仍超时**：程序会 **照样写入 `--out` 文件**（含已拉取的 Activity + Orderbook），`pnl_user_positions` 内为 `_spike_error`，并设 `_spike_partial_failure`；进程 **退出码非 0**。输出路径为**运行命令时的当前目录**下的文件名（例如 `~/Polymarket-Analyzer/full.json`）。
 
 子图文档：[Polymarket Subgraph](https://docs.polymarket.com/market-data/subgraph)
 
