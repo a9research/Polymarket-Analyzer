@@ -32,17 +32,27 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      # 容器内用服务名 postgres 访问数据库（覆盖任何 config 中的 host）
+      # 连本 compose 里的 Postgres；无则程序无缓存/raw（仍可做纯分析）
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/polymarket_analyzer
+      # 日志级别：info / debug 等，见 README「标准环境变量」
       RUST_LOG: ${RUST_LOG:-info}
+      # 以下为可选业务参数（含义见 README「PAA_* 参数说明」）；取消注释即生效
+      # Data API 每页条数与翻页步长，1～10000
+      # PAA_TRADES_PAGE_LIMIT: "3000"
+      # 每页 Data API 请求之间的间隔（毫秒），防限流
+      # PAA_RATE_LIMIT_MS: "200"
+      # 默认是否拉 Goldsky 子图（true/false）；单次请求仍可用 ?with_subgraph= 覆盖
+      # PAA_SUBGRAPH_ENABLED: "true"
+      # 子图每条流最多翻页数，控制耗时与数据量
+      # PAA_SUBGRAPH_MAX_PAGES: "300"
     ports:
       - "3000:3000"
     depends_on:
       postgres:
         condition: service_healthy
-    # 默认：REST API；子图/对账等用 query 或挂载 config 后改 command
+    # 默认：REST API。分页/子图默认等：用上面 PAA_* 或挂载 config — README「配置：TOML、PAA…」
     command: ["serve", "--bind", "0.0.0.0:3000"]
-    # 可选：挂载自定义 TOML（须同时加 --config）
+    # 使用自定义 TOML：先 cp config.docker.example.toml config.docker.toml 并编辑，再取消下面三行注释
     # volumes:
     #   - ./config.docker.toml:/config/config.toml:ro
     # command: ["--config", "/config/config.toml", "serve", "--bind", "0.0.0.0:3000"]

@@ -19,6 +19,7 @@
 - [架构与工作流](#架构与工作流)
 - [仓库结构](#仓库结构)
 - [快速开始](#快速开始)（含 **[配置文件怎么用](#配置文件怎么用必读)**）
+- [配置：TOML、PAA 环境变量与 Docker](#paaconfig)
 - [Docker Compose 部署](#docker-compose-部署)
 - [数据量与分页（拉多少条）](#数据量与分页拉多少条)
 - [功能开关与覆盖（CLI / HTTP）](#功能开关与覆盖cli--http)
@@ -179,6 +180,123 @@ cargo run --release -- --config config.toml serve --bind 127.0.0.1:3000
 
 ---
 
+<a id="paaconfig"></a>
+
+## 配置：TOML、PAA 环境变量与 Docker
+
+环境变量名中带 **`PAA_`** 前缀（见下表），避免与系统变量冲突。
+
+### 能在 `docker-compose.yml` 里写参数吗？
+
+**可以。** 在 `analyzer` 服务的 **`environment:`** 里配置即可，无需挂载 `config.toml`：
+
+| 方式 | 说明 |
+|------|------|
+| **标准变量** | **`DATABASE_URL`**、**`RUST_LOG`** 见下表；不经过 `PAA_` 前缀。 |
+| **`PAA_*` 前缀** | 覆盖应用业务参数。**生效顺序**：代码默认 → `--config` TOML（若有）→ **`PAA_*`（若设置且可解析）**。之后 **`analyze` 的 CLI / HTTP query** 仍可在**当次**覆盖部分开关（例如 `with_subgraph`）。 |
+
+#### 标准环境变量（非 PAA\_）
+
+| 变量 | 是什么意思、用来干嘛 |
+|------|----------------------|
+| **`DATABASE_URL`** | **PostgreSQL 连接串**。有它且连得上时：会启用**报告缓存**（`report_cache_kv`）、可选 **raw / canonical** 等落库；没有则程序照样能分析，只是**纯内存、无缓存**。Docker Compose 里指向服务名 **`postgres`** 和 compose 里建的库。 |
+| **`RUST_LOG`** | **日志级别**（`tracing` / `tracing-subscriber`）。例如 `info`、`debug`。用来**排错**、看请求与上游错误；不改变业务结果。常用：`RUST_LOG=info` 或 `RUST_LOG=polymarket_account_analyzer=debug`。 |
+
+#### `PAA_*` 参数说明（完整实现在 `config::apply_env_overrides`）
+
+| 变量 | 是什么意思、用来干嘛 |
+|------|----------------------|
+| **`PAA_TRADES_PAGE_LIMIT`** | 向 Polymarket **Data API** 拉成交时，每一页请求多少条，同时也是 **翻页的 offset 步长**。**调大**可减少 HTTP 次数；**过大**单次响应更重。合法范围程序内限制为 **1～10000**（与官方上限一致）。 |
+| **`PAA_RATE_LIMIT_MS`** | 每拉**一页** Data API 后**休眠多少毫秒**再拉下一页，用来**降低被限流**的概率。只影响速度与节奏，不改变「总共能拉多少」的上限（那由服务端 offset 等规则决定）。 |
+| **`PAA_CACHE_TTL_SEC`** | **同钱包、同配置指纹**的报告在 Postgres 里缓存**多少秒内视为仍有效**。过期后会重新算报告。用来**省重复计算**和上游流量。 |
+| **`PAA_TIMEOUT_SEC`** | 访问 **Data API** 和 **Gamma**（市场元信息）时，单次 HTTP 请求**最多等多少秒**。网络慢或接口卡顿时**调大**可减少误超时；**调小**可更快失败重试（取决于你的运维策略）。 |
+| **`PAA_SUBGRAPH_ENABLED`** | 是否在**默认**情况下就拉 **Goldsky 子图**（赎回、成交 fill、PnL 等）。`true`/`1`/`yes`/`on` 为开，`false`/`0` 等为关。仍可在单次请求用 URL 的 `with_subgraph` 等**再改**。 |
+| **`PAA_SUBGRAPH_PAGE_SIZE`** | 子图 GraphQL 查询里**每页返回多少条**。影响单次查询体量和翻页次数。 |
+| **`PAA_SUBGRAPH_MAX_PAGES`** | 每个子图数据流**最多翻多少页**，用来**防止极端大户无限拉取**、控制时间与费用。 |
+| **`PAA_SUBGRAPH_POSITIONS_PAGE_SIZE`** | **PnL 子图里 `userPositions`（持仓）** 分页大小；与活动/成交类流的分页是两套逻辑。 |
+| **`PAA_SUBGRAPH_CAP_ROWS_PER_STREAM`** | 每条子图流**最多保留多少行**；达到后停止继续拉该流。**`0` 表示不限制**。适合做**冒烟测试**或给大户**封顶成本**；也可被单次请求的 `subgraph_cap_rows` 覆盖。 |
+| **`PAA_SKIP_PNL_POSITIONS`** | 为 `true` 时**不拉 PnL 里的仓位列表**，可**明显缩短**大户运行时间，但报告里与仓位相关的子图信息会少。 |
+| **`PAA_EXTENDED_FILL_FIELDS`** | 是否在子图 `orderFilledEvent` 上**请求额外字段**（如 tx、condition、size、price）。**利于对账与 canonical**；若子图端拒绝，程序会**自动回退**到精简字段。 |
+| **`PAA_RECONCILIATION_ENABLED`** | 是否在默认流程里做 **Data API 与子图（及 canonical）之间的对账摘要**（v0/v1 逻辑由是否开 canonical 等决定）。 |
+| **`PAA_CANONICAL_ENABLED`** | 是否做 **规范层合并**并把结果**写入 Postgres**（`canonical_events` 等）。依赖 **已配置数据库** 且一般与 **raw 落库**一起用；用于可追溯、PG 重放报告等。 |
+| **`PAA_PERSIST_RAW`** | 是否在分析跑批时把 **原始 API/子图块** 写入 **`raw_*` 表**。关则只做报告（若开了缓存仍有 `report_cache`），**不做行级 raw 审计**。 |
+| **`PAA_ANALYTICS_SOURCE`** | **主报告指标**（lifetime、分布、策略反推等）基于哪条「成交流」：**`data_api`** = 直接用 Data API 成交；**`canonical`** = 优先用内存合并后的合成成交（没有则回退 Data API）。 |
+| **`PAA_ANALYTICS_CANONICAL_SHADOW`** | 是否在算主指标的同时**也算一套 canonical 影子指标**（`metrics_canonical_shadow`），用于**对比 Data API 与合并视图**、在报告 notes 里提示差异。 |
+| **`PAA_ENRICH_MARKETS_DIM`** | 是否用 **Gamma** 把市场里出现的 slug **补进 `markets_dim` 维表**（便于后续分析与展示）。需要外网访问 Gamma。 |
+
+**尚未通过 `PAA_*` 暴露的**（仍需 TOML）：`[market_type]` 规则、`[reconciliation]` 里容差/阈值、`[subgraph]` 超时/重试秒数等 —— 需要时用 **`--config` + 挂载文件**。
+
+### 哪些主要靠 TOML（或上面的 `PAA_*`）
+
+| 类别 | 示例 |
+|------|------|
+| **Data API 节奏** | `trades_page_limit` → **`PAA_TRADES_PAGE_LIMIT`** 或 TOML |
+| **子图分页等** | `page_size` / `max_pages` → **`PAA_SUBGRAPH_*`** 或 TOML（**`subgraph_cap_rows` 仍可**在 URL/CLI 当次覆盖） |
+| **分析 / 对账** | `[analytics]` 部分字段有 **`PAA_`**；容差、阈值等仍靠 TOML |
+| **落库 / 规范层** | **`PAA_PERSIST_RAW`**、**`PAA_CANONICAL_ENABLED`** 等或 TOML；**`[market_type]` 仅 TOML** |
+
+无 `--config` 时：只靠 **默认 + `PAA_*` + `DATABASE_URL`** 即可跑 Docker。带 `--config` 时：TOML 先合并，再由 **`PAA_*`** 覆盖同名字段。
+
+调用时加参数能改的，见 [功能开关与覆盖（CLI / HTTP）](#功能开关与覆盖cli--http)。
+
+### 不用 Docker（本机）
+
+1. 进入仓库根目录 **`Polymarket-Analyzer/`**。  
+2. 复制模板并编辑：  
+   `cp config.example.toml config.toml`  
+3. 在 `config.toml` 里改需要的项（例如 `trades_page_limit`、`[subgraph]`）。  
+4. **数据库**：在 `config.toml` 写 `database_url`，或**不写**该项、改用环境变量 **`DATABASE_URL`**（见上文优先级说明）。  
+5. 每次运行**显式**带上配置文件，例如：
+
+```bash
+# CLI 分析
+cargo run --release -- --config config.toml analyze 0x你的钱包地址 --out report.json
+
+# 或已编译的二进制
+./target/release/polymarket-account-analyzer --config config.toml serve --bind 127.0.0.1:3000
+```
+
+`config.toml` 已在 `.gitignore` 中，勿把含口令的文件提交到 Git。
+
+### 在 Docker Compose 中挂载配置
+
+1. 在 **`Polymarket-Analyzer/`** 下复制 Docker 用模板：  
+   `cp config.docker.example.toml config.docker.toml`  
+2. 编辑 **`config.docker.toml`**（按需改 `trades_page_limit`、`[subgraph]` 等）。  
+   - **建议不写 `database_url`**：这样会继续使用 `docker-compose.yml` 里已为容器设好的 **`DATABASE_URL`**（`postgres` 服务名 + 库名）。  
+   - 若你写了 `database_url`，主机名必须是 **`postgres`**，且账号库名与 compose 一致，例如：  
+     `postgres://postgres:postgres@postgres:5432/polymarket_analyzer`  
+3. 编辑 **`docker-compose.yml`** 里 `analyzer` 服务：把原来的 **`command: ["serve", "--bind", "0.0.0.0:3000"]` 整行删掉或改成注释**，改为下面两段（**同一个服务里只能有一个 `command:`**）：
+
+```yaml
+    volumes:
+      - ./config.docker.toml:/config/config.toml:ro
+    command: ["--config", "/config/config.toml", "serve", "--bind", "0.0.0.0:3000"]
+```
+
+（也可直接编辑仓库里已写好的注释块：删掉默认 `command` 行，再取消下面 `volumes` / `command` 的注释。）
+
+4. 重新启动：
+
+```bash
+docker compose up --build -d
+```
+
+之后 **`trades_page_limit` 等 TOML 项**会对 **`GET /analyze/...`** 生效；仍可在 URL 上加 `with_subgraph` 等做当次覆盖。
+
+**一次性 `docker compose run`（带配置）** 示例：
+
+```bash
+docker compose run --rm \
+  -v "$(pwd)/config.docker.toml:/config/config.toml:ro" \
+  -v "$(pwd)/out:/out" \
+  analyzer --config /config/config.toml analyze 0x你的钱包地址 --out /out/report.json
+```
+
+`config.docker.toml` 已列入 `.gitignore`，请勿提交含敏感信息的副本。
+
+---
+
 ## Docker Compose 部署
 
 可以用 **`docker-compose.yml`** 同时拉起 **PostgreSQL** 与本程序的 **HTTP 服务**（默认 `serve`），容器内通过服务名 **`postgres`** 访问数据库；`DATABASE_URL` 已在 compose 里写好，**无需**再拷 `config.toml` 也能用缓存与 raw 落库（仍可用 query 打开子图/对账等）。
@@ -212,7 +330,7 @@ docker compose run --rm -v "$(pwd)/out:/out" analyzer \
   analyze 0x你的钱包地址 --out /out/report.json
 ```
 
-**自定义 TOML（分页、子图默认开启等）：** 复制 `config.example.toml` 为 `config.docker.toml` 并修改；在 `docker-compose.yml` 里取消注释 `analyzer.volumes` 与带 `--config` 的 `command`（库地址建议仍指向 `postgres:5432` 与 compose 中库名一致）。注意：**TOML 里若写了非空的 `database_url`，会优先于 compose 的 `DATABASE_URL` 环境变量**。
+**要靠 TOML / `PAA_*` / 挂载文件调的参数：** 见 **[配置：TOML、PAA 环境变量与 Docker](#paaconfig)**；仓库内 **`config.docker.example.toml`** 可复制为 **`config.docker.toml`**（挂载 `--config` 时用）。
 
 **文件说明：**
 
@@ -220,6 +338,7 @@ docker compose run --rm -v "$(pwd)/out:/out" analyzer \
 |------|------|
 | `Dockerfile` | 多阶段构建 release 二进制；运行时仅 `ca-certificates`（HTTPS） |
 | `docker-compose.yml` | `postgres`（健康检查）+ `analyzer`（默认 `0.0.0.0:3000`） |
+| `config.docker.example.toml` | Compose 挂载用 TOML 模板 → `config.docker.toml`（见「配置：TOML、PAA…」） |
 | `.dockerignore` | 缩小构建上下文 |
 
 **生产注意：** 修改默认数据库口令、不要用示例口令；默认 **未** 把 Postgres 端口映射到宿主机；需要本机 `psql` 调试时再在 compose 里打开 `ports`。日志级别：`RUST_LOG=debug docker compose up`。
@@ -344,7 +463,7 @@ curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_row
 
 ## 配置详解（TOML）
 
-复制 **`config.example.toml` → `config.toml`** 后按需编辑；运行时务必 **`--config config.toml`**，否则该文件**不会被读取**（见上文 **[配置文件怎么用（必读）](#配置文件怎么用必读)**）。
+复制 **`config.example.toml` → `config.toml`** 后按需编辑；运行时务必 **`--config config.toml`**，否则该文件**不会被读取**（见 **[配置文件怎么用（必读）](#配置文件怎么用必读)**）。**本地 vs Docker Compose 操作步骤**见 **[配置：TOML、PAA 环境变量与 Docker](#paaconfig)**。
 
 连接数据库：**TOML 里 `database_url` 非空则优先**；否则用环境变量 **`DATABASE_URL`**（`init_storage`）。
 

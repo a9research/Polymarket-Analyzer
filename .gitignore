@@ -3,6 +3,7 @@
 
 # Config with secrets (keep example)
 config.toml
+config.docker.toml
 
 # Env
 .env

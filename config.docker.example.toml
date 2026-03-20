@@ -1,0 +1,36 @@
+# 给 Docker Compose 用的配置模板（可提交到 Git，不含密钥）
+#
+# 使用步骤：
+#   cp config.docker.example.toml config.docker.toml
+#   按需编辑 config.docker.toml
+#   在 docker-compose.yml 里挂载 + --config；或更简单：在 compose 的 environment 里设 PAA_*（见 README）
+#
+# 建议不要在本文件里写 database_url：留空则容器仍使用 compose 的 DATABASE_URL 环境变量。
+# 若你写了 database_url，必须指向容器网络内的库，例如：
+#   database_url = "postgres://postgres:postgres@postgres:5432/polymarket_analyzer"
+
+trades_page_limit = 3000
+rate_limit_ms = 200
+
+# cache_ttl_sec = 600
+# timeout_sec = 90
+
+[subgraph]
+# 默认仍由 URL 的 ?with_subgraph=true 打开；此处可设分页等
+# enabled = true
+# page_size = 1000
+# max_pages = 300
+# cap_rows_per_stream = 0
+
+[analytics]
+source = "data_api"
+canonical_shadow = true
+
+[ingestion]
+persist_raw = true
+
+[canonical]
+enabled = false
+
+[reconciliation]
+enabled = false

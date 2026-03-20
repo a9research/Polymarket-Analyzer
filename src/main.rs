@@ -5,7 +5,7 @@ use polymarket_account_analyzer::{
         build_canonical_merge, compute_shadow_metrics, normalize_condition_id,
         slug_map_from_canonical_events, synthetic_trades_from_events, CanonicalPipelineParams,
     },
-    config::{load_config, report_cache_key, AppConfig, ReconciliationConfig},
+    config::{apply_env_overrides, load_config, report_cache_key, AppConfig, ReconciliationConfig},
     polymarket::{
         data_api::{DataApiClient, Trade, TradeSide},
         gamma_api::GammaApiClient,
@@ -249,7 +249,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = load_config(cli.config.as_deref())?;
+    let mut cfg = load_config(cli.config.as_deref())?;
+    apply_env_overrides(&mut cfg);
 
     match cli.cmd {
         Command::Analyze {

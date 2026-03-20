@@ -362,6 +362,121 @@ pub fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<AppConfig> 
     Ok(AppConfig::default().merge(cfg))
 }
 
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Optional overrides from environment (Docker Compose `environment:` 等).
+///
+/// 前缀 **`PAA_`**（Polymarket Account Analyzer）避免与系统变量冲突。  
+/// **生效顺序**：代码默认 → `--config` TOML（若有）→ **本函数**（仅当对应变量已设置且可解析）。
+pub fn apply_env_overrides(cfg: &mut AppConfig) {
+    if let Ok(v) = std::env::var("PAA_TRADES_PAGE_LIMIT") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            if (1..=10_000).contains(&n) {
+                cfg.trades_page_limit = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_RATE_LIMIT_MS") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            if n > 0 {
+                cfg.rate_limit_ms = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_CACHE_TTL_SEC") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            if n > 0 {
+                cfg.cache_ttl_sec = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_TIMEOUT_SEC") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            if n > 0 {
+                cfg.timeout_sec = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_SUBGRAPH_ENABLED") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.subgraph.enabled = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_SUBGRAPH_PAGE_SIZE") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            if n > 0 {
+                cfg.subgraph.page_size = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_SUBGRAPH_MAX_PAGES") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            if n > 0 {
+                cfg.subgraph.max_pages = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_SUBGRAPH_POSITIONS_PAGE_SIZE") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            if n > 0 {
+                cfg.subgraph.positions_page_size = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_SUBGRAPH_CAP_ROWS_PER_STREAM") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            cfg.subgraph.cap_rows_per_stream = n;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_SKIP_PNL_POSITIONS") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.subgraph.skip_pnl_positions = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_EXTENDED_FILL_FIELDS") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.subgraph.extended_fill_fields = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_RECONCILIATION_ENABLED") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.reconciliation.enabled = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_CANONICAL_ENABLED") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.canonical.enabled = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_PERSIST_RAW") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.ingestion.persist_raw = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_ANALYTICS_SOURCE") {
+        let s = v.trim();
+        if s == "data_api" || s == "canonical" {
+            cfg.analytics.source = s.to_string();
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_ANALYTICS_CANONICAL_SHADOW") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.analytics.canonical_shadow = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_ENRICH_MARKETS_DIM") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.canonical.enrich_markets_dim = b;
+        }
+    }
+}
+
 trait Merge {
     fn merge(self, other: Self) -> Self;
 }
