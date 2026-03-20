@@ -17,7 +17,7 @@
 - [能做什么](#能做什么)
 - [架构与工作流](#架构与工作流)
 - [仓库结构](#仓库结构)
-- [快速开始](#快速开始)
+- [快速开始](#快速开始)（含 **[配置文件怎么用](#配置文件怎么用必读)**）
 - [数据量与分页（拉多少条）](#数据量与分页拉多少条)
 - [功能开关与覆盖（CLI / HTTP）](#功能开关与覆盖cli--http)
 - [CLI 命令与示例](#cli-命令与示例)
@@ -130,9 +130,46 @@ cargo run --release -- analyze 0x5924ca480d8b08cd5f3e5811fa378c4082475af6 \
 cargo run --release -- serve --bind 127.0.0.1:3000
 ```
 
-**配置：** `cp config.example.toml config.toml`，设置 `database_url` 或使用环境变量 **`DATABASE_URL`**。
+### 配置文件怎么用（必读）
 
-未传 **`--config`** 时：**不读取任何 TOML 文件**，使用代码内默认值（见下表「默认值」列）。
+程序 **不会** 自动读取当前目录下的 `config.toml`。只有你在命令行里写了 **`--config /某路径/某文件.toml`** 时，才会去读那个文件；否则一律用 **编译在程序里的默认配置**（例如 `trades_page_limit = 500`、无数据库连接串等）。
+
+| 你怎么运行 | 实际生效的配置 |
+|------------|----------------|
+| **不写 `--config`** | 不读任何 TOML；全部用代码默认值。此时若要连 Postgres，只能依赖环境变量 **`DATABASE_URL`**（见下）。 |
+| **`--config config.toml`** | 读取该文件，在默认值上 **合并覆盖**（文件里写了的项才改）。 |
+
+**数据库连接串怎么给：**
+
+1. **写在 TOML 里**：`database_url = "postgres://..."`（在你用 `--config` 加载的那份文件里）。  
+2. **环境变量**：`export DATABASE_URL="postgres://..."`  
+3. **两者都有时**：以 **TOML 里的 `database_url` 为准**（非空则不用环境变量）。
+
+**常见用法示例：**
+
+```bash
+cd polymarket-account-analyzer
+
+# --- 1）零配置文件：只分析钱包，不要 Postgres（报告打印到终端）---
+cargo run --release -- analyze 0x你的钱包地址
+
+# --- 2）零配置文件，但要缓存/落库：只用环境变量指数据库 ---
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/polymarket_analyzer"
+cargo run --release -- analyze 0x你的钱包地址 --out report.json
+
+# --- 3）用配置文件：先复制模板，再每次显式带上 --config ---
+cp config.example.toml config.toml
+# 编辑 config.toml（改 database_url、trades_page_limit、[subgraph] 等）
+cargo run --release -- --config config.toml analyze 0x你的钱包地址 --out report.json
+
+# --- 4）API 模式同样要指定配置文件（若你需要 TOML 里的设置）---
+cargo run --release -- --config config.toml serve --bind 127.0.0.1:3000
+```
+
+**注意：** `cargo run` 后面第一个 **`--`** 用来把参数交给本程序；因此带配置文件时推荐写成：  
+`cargo run --release -- --config config.toml analyze ...`  
+（若你直接运行二进制 `./target/release/polymarket-account-analyzer`，则写成：  
+`./target/release/polymarket-account-analyzer --config config.toml analyze ...`。）
 
 ---
 
@@ -254,7 +291,9 @@ curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_row
 
 ## 配置详解（TOML）
 
-复制 **`config.example.toml` → `config.toml`** 后按需修改。连接数据库时：**若 `config.toml` 里配置了 `database_url` 则优先使用**；否则回退环境变量 **`DATABASE_URL`**（见 `init_storage`）。
+复制 **`config.example.toml` → `config.toml`** 后按需编辑；运行时务必 **`--config config.toml`**，否则该文件**不会被读取**（见上文 **[配置文件怎么用（必读）](#配置文件怎么用必读)**）。
+
+连接数据库：**TOML 里 `database_url` 非空则优先**；否则用环境变量 **`DATABASE_URL`**（`init_storage`）。
 
 ### 顶层常用项
 
