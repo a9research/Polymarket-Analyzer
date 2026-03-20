@@ -8,7 +8,8 @@
 |--|--|
 | **语言** | Rust (stable) |
 | **许可证** | Apache-2.0 |
-| **本 crate 路径** |  monorepo 内 `polymarket-account-analyzer/`（仓库根目录为上一级 `account-analyzer/`） |
+| **GitHub 克隆目录** | `git clone … Polymarket-Analyzer.git` 后进入 **`Polymarket-Analyzer/`**（即本仓库根目录，与 `Cargo.toml` 同级） |
+| **二进制文件名** | `cargo build --release` 生成 `target/release/polymarket-account-analyzer`（与 Rust 包名一致，与文件夹名无关） |
 
 ---
 
@@ -18,6 +19,7 @@
 - [架构与工作流](#架构与工作流)
 - [仓库结构](#仓库结构)
 - [快速开始](#快速开始)（含 **[配置文件怎么用](#配置文件怎么用必读)**）
+- [Docker Compose 部署](#docker-compose-部署)
 - [数据量与分页（拉多少条）](#数据量与分页拉多少条)
 - [功能开关与覆盖（CLI / HTTP）](#功能开关与覆盖cli--http)
 - [CLI 命令与示例](#cli-命令与示例)
@@ -44,7 +46,7 @@
 | **存储** | 可选 PG：**报告缓存**（`report_cache_kv` + 配置指纹）、行级 **raw**、**markets_dim**、**canonical_events** 等（见下表） |
 | **输出** | CLI stdout / `--out`；`serve` 后 `GET /analyze/:wallet` |
 
-**非目标：** 不保证「链上绝对全历史」（受 Data API offset 上限与公共子图限制）；不提供前端页面；不在本 crate 内实现 Turbo/自建索引（见 [raw 表契约](../artifacts/raw-ingestion-contract.md)）。
+**非目标：** 不保证「链上绝对全历史」（受 Data API offset 上限与公共子图限制）；不提供前端页面；不在本 crate 内实现 Turbo/自建索引（扩展规划见下方 [相关文档](#相关文档) 中 `artifacts/` 链接，**仅 monorepo 含该目录时可用**）。
 
 ---
 
@@ -82,33 +84,37 @@
 
 ## 仓库结构
 
-Monorepo 根目录（`account-analyzer/`）中与本工具相关的主要路径：
+**标准 GitHub 克隆**（仓库 **[Polymarket-Analyzer](https://github.com/a9research/Polymarket-Analyzer)**）后，项目根目录名为 **`Polymarket-Analyzer/`**，主要文件：
 
 ```
-account-analyzer/
-├── polymarket-account-analyzer/    # ← 本 README 所在 crate
-│   ├── src/
-│   │   ├── main.rs                 # CLI、analyze 流水线、serve、PG 重放
-│   │   ├── config.rs               # TOML、report_cache_key（配置指纹）
-│   │   ├── report.rs               # AnalyzeReport schema 2.x
-│   │   ├── storage.rs              # Postgres init_schema + 读写
-│   │   ├── reconciliation.rs       # v0 / v1 摘要、quality_alert
-│   │   ├── canonical.rs            # v1 合并、shadow、synthetic trades
-│   │   └── polymarket/             # data_api、gamma_api、subgraph
-│   ├── tests/regression_merge.rs   # 无网络集成测试
-│   └── config.example.toml
-├── artifacts/                      # PROJECT-OVERVIEW、规划、手工清单、progress-log
-├── scripts/regression-check.sh
-└── docs/、memory/、specs/、task_plan.md …
+Polymarket-Analyzer/
+├── Cargo.toml
+├── Cargo.lock
+├── README.md
+├── Dockerfile
+├── docker-compose.yml
+├── config.example.toml
+├── src/
+│   ├── main.rs
+│   ├── config.rs
+│   ├── report.rs
+│   ├── storage.rs
+│   ├── reconciliation.rs
+│   ├── canonical.rs
+│   └── polymarket/                 # data_api、gamma_api、subgraph
+└── tests/
+    └── regression_merge.rs
 ```
+
+若你在**更大 monorepo** 里把本 crate 放在子目录（例如 `…/polymarket-account-analyzer/`），则所有命令里的 `cd` 改为进入**该子目录**即可；文档中的 `../artifacts/` 等链接仅在上级仓库实际包含这些目录时有效。
 
 ---
 
 ## 快速开始
 
 ```bash
-# 在 monorepo 中进入 crate 目录
-cd polymarket-account-analyzer
+git clone https://github.com/a9research/Polymarket-Analyzer.git
+cd Polymarket-Analyzer
 
 # 编译
 cargo build --release
@@ -148,7 +154,7 @@ cargo run --release -- serve --bind 127.0.0.1:3000
 **常见用法示例：**
 
 ```bash
-cd polymarket-account-analyzer
+cd Polymarket-Analyzer
 
 # --- 1）零配置文件：只分析钱包，不要 Postgres（报告打印到终端）---
 cargo run --release -- analyze 0x你的钱包地址
@@ -170,6 +176,53 @@ cargo run --release -- --config config.toml serve --bind 127.0.0.1:3000
 `cargo run --release -- --config config.toml analyze ...`  
 （若你直接运行二进制 `./target/release/polymarket-account-analyzer`，则写成：  
 `./target/release/polymarket-account-analyzer --config config.toml analyze ...`。）
+
+---
+
+## Docker Compose 部署
+
+可以用 **`docker-compose.yml`** 同时拉起 **PostgreSQL** 与本程序的 **HTTP 服务**（默认 `serve`），容器内通过服务名 **`postgres`** 访问数据库；`DATABASE_URL` 已在 compose 里写好，**无需**再拷 `config.toml` 也能用缓存与 raw 落库（仍可用 query 打开子图/对账等）。
+
+**前置：** 已安装 [Docker](https://docs.docker.com/get-docker/) 与 [Docker Compose V2](https://docs.docker.com/compose/)（`docker compose` 命令）。
+
+```bash
+cd Polymarket-Analyzer
+
+# 构建并后台启动（Postgres + analyzer API）
+docker compose up --build -d
+
+# 健康检查通过后，本机访问 API（钱包地址按实际替换）
+curl -s "http://127.0.0.1:3000/analyze/0x你的钱包地址" | jq .
+
+# 子图 + 对账（仅当次 query，不写进镜像）
+curl -s "http://127.0.0.1:3000/analyze/0x你的钱包地址?with_subgraph=true&with_reconciliation=true" | jq .
+
+# 查看日志
+docker compose logs -f analyzer
+
+# 停止并删除容器（数据卷保留）
+docker compose down
+```
+
+**一次性 CLI 分析（不进常驻 API）：** 把报告写到宿主机目录 `./out`：
+
+```bash
+mkdir -p out
+docker compose run --rm -v "$(pwd)/out:/out" analyzer \
+  analyze 0x你的钱包地址 --out /out/report.json
+```
+
+**自定义 TOML（分页、子图默认开启等）：** 复制 `config.example.toml` 为 `config.docker.toml` 并修改；在 `docker-compose.yml` 里取消注释 `analyzer.volumes` 与带 `--config` 的 `command`（库地址建议仍指向 `postgres:5432` 与 compose 中库名一致）。注意：**TOML 里若写了非空的 `database_url`，会优先于 compose 的 `DATABASE_URL` 环境变量**。
+
+**文件说明：**
+
+| 文件 | 作用 |
+|------|------|
+| `Dockerfile` | 多阶段构建 release 二进制；运行时仅 `ca-certificates`（HTTPS） |
+| `docker-compose.yml` | `postgres`（健康检查）+ `analyzer`（默认 `0.0.0.0:3000`） |
+| `.dockerignore` | 缩小构建上下文 |
+
+**生产注意：** 修改默认数据库口令、不要用示例口令；默认 **未** 把 Postgres 端口映射到宿主机；需要本机 `psql` 调试时再在 compose 里打开 `ports`。日志级别：`RUST_LOG=debug docker compose up`。
 
 ---
 
@@ -349,7 +402,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 - **Gamma**：市场元信息（如 `endDate` / `closedTime`）  
 - **子图**：[Polymarket Subgraph 文档](https://docs.polymarket.com/market-data/subgraph)；PnL `userPositions` 使用 **`id_gt` 游标分页**，避免深 `skip` 超时。
 
-**历史深度：** 服务端可能对 offset 设硬上限（如 `max historical activity offset of 3000 exceeded`）。本工具会停止翻页并在报告中标注 **`data_fetch.truncated`** / **`ingestion.truncation.data_api`**。更全链上历史需其他管道（子图全量、自建索引等），见上级目录 [**`artifacts/report-and-reconciliation-plan.md`**](../artifacts/report-and-reconciliation-plan.md)。
+**历史深度：** 服务端可能对 offset 设硬上限（如 `max historical activity offset of 3000 exceeded`）。本工具会停止翻页并在报告中标注 **`data_fetch.truncated`** / **`ingestion.truncation.data_api`**。更全链上历史需其他管道（子图全量、自建索引等）；详细规划见 [相关文档](#相关文档) 中的 **`report-and-reconciliation-plan.md`**（路径因仓库布局而异）。
 
 ---
 
@@ -377,18 +430,18 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 ## 开发与测试
 
 ```bash
-cd polymarket-account-analyzer
+cd Polymarket-Analyzer
 cargo test              # 含 tests/regression_merge.rs（7 项，无网络）
 cargo build --release
 ```
 
-Monorepo 根目录一键脚本（若存在）：
+若上游 monorepo 根目录提供一键脚本（本仓库单独克隆时**可能没有**）：
 
 ```bash
 ./scripts/regression-check.sh
 ```
 
-手工验收步骤：[ **`artifacts/manual-test-checklist.md`**](../artifacts/manual-test-checklist.md)。
+手工验收清单：见 [相关文档](#相关文档) 中的 **`manual-test-checklist.md`**（同上，仅部分仓库布局存在）。
 
 ---
 
@@ -413,11 +466,13 @@ Monorepo 根目录一键脚本（若存在）：
 | API | HTTP 暴露 `report-from-canonical-run`；PG 重放联查 `markets_dim` |
 | 基础设施 | 链上绝对全量（Turbo/自建索引）**不在本 crate 范围** |
 
-更细的差距矩阵见 [**`artifacts/report-and-reconciliation-plan.md`**](../artifacts/report-and-reconciliation-plan.md) §1.5.4。
+更细的差距矩阵见 **`report-and-reconciliation-plan.md`** §1.5.4（路径见下表）。
 
 ---
 
 ## 相关文档
+
+**说明：** 单独克隆 **`Polymarket-Analyzer`** 时，仓库内**通常没有**下表中的 `artifacts/`、`task_plan.md` 等文件（它们可能只存在于上游 **Forevex / account-analyzer** 类 monorepo）。若链接 404，以本 README 与源码为准即可。
 
 | 文档 | 内容 |
 |------|------|

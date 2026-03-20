@@ -1,0 +1,22 @@
+# Build artifact (rebuilt in container)
+target/
+
+# Git / local secrets
+.git
+.gitignore
+.env
+.env.*
+*.local
+
+# Local config (use env or bind-mount in compose)
+config.toml
+
+# IDE / OS
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Outputs
+report.json
+*.log

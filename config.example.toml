@@ -1,3 +1,4 @@
+# Docker：见仓库根 `docker-compose.yml` + README「Docker Compose 部署」；容器内库主机名为 postgres。
 # --- 顶层：Data API 节奏与分页（详见 README「数据量与分页」）---
 # 两次 Data API 请求之间的间隔（毫秒）
 rate_limit_ms = 150
