@@ -4,11 +4,62 @@ rate_limit_ms = 150
 # Trades page size for GET /trades (same as offset step). Example: 3000 => usually 2 requests up to max offset 3000.
 # trades_page_limit = 3000
 
+# HTTP timeout for Data API / Gamma (seconds)
+# timeout_sec = 90
+
 # Cache TTL in seconds
 cache_ttl_sec = 600
 
 # Optional: can also be provided by env var DATABASE_URL
 database_url = "postgres://postgres:postgres@localhost:5432/polymarket_analyzer"
+
+# --- Subgraph (Goldsky GraphQL), merged into `analyze` / `serve` when enabled ---
+[subgraph]
+# Default false; enable with `enabled = true` or CLI/API `--with-subgraph`
+enabled = false
+# activity_url / orderbook_url / pnl_url use built-in Goldsky defaults if omitted
+# page_size = 1000
+# max_pages = 500
+# positions_page_size = 100
+# skip_pnl_positions = false
+# timeout_sec = 600
+# max_retries = 5
+# pnl_max_retries = 8
+# cap_rows_per_stream = 0   # 0 = no cap; use e.g. 1000 for smoke tests
+# show_progress = true
+# user_agent = "polymarket-account-analyzer/0.2 (subgraph)"
+# Request extra orderFilledEvent fields (tx hash, condition, size, price); auto-falls back if subgraph rejects.
+# extended_fill_fields = true
+
+# --- Analytics: which trade stream feeds lifetime/distribution/patterns (§1.5) ---
+[analytics]
+# Primary input for metrics: "data_api" (default) or "canonical" (synthetic trades from merged events; falls back if empty).
+source = "data_api"
+# When true (default), run in-memory canonical merge when possible and emit metrics_canonical_shadow + note on reconciliation_v1.
+canonical_shadow = true
+
+# --- Reconciliation: v0 (timestamp-only) when canonical off; v1 params used for canonical merge ---
+[reconciliation]
+enabled = false
+# time_window_sec = 120
+# size_tolerance_pct = 0.05
+# price_tolerance_abs = 0.02
+# require_condition_match = false
+# rules_version = "1"
+# P2 quality thresholds (also part of report_cache fingerprint)
+# shadow_volume_alert_ratio = 0.30   # canonical_shadow: rel volume diff vs primary → quality_alert in notes
+# api_only_ratio_alert = 0.40       # v1: api_only/(matched+api_only) above this and api_only ≥ min → alert
+# api_only_alert_min = 12
+
+# --- Raw ingestion: write ingestion_run + raw_ingestion_chunk when DATABASE_URL is set ---
+[ingestion]
+persist_raw = true
+
+# --- Canonical merge (Postgres): raw_* row tables, markets_dim, canonical_events, source_event_map, reconciliation_report ---
+[canonical]
+# Requires persist_raw + DATABASE_URL. Use `--with-canonical` / `?with_canonical=true` to override.
+enabled = false
+# enrich_markets_dim = true   # Gamma upsert into markets_dim for distinct trade slugs
 
 [market_type]
 default_type = "unknown"
