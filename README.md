@@ -109,7 +109,16 @@ cargo run --example subgraph_spike -- --out subgraph_spike.json 0xYourWallet...
 
 # 仍要同时在终端打印各段 JSON（可能很长）
 cargo run --example subgraph_spike -- --out subgraph_spike.json --tee 0xYourWallet...
+
+# 全量分页（默认）：Activity / Orderbook 用 first+skip；PnL userPositions 用 id 游标（id_gt），避免深 skip 触发托管库 statement timeout
+# 可调：--page-size（1..=1000）、--max-pages（安全上限，默认 500）
+cargo run --example subgraph_spike -- --out full.json 0xYourWallet...
+
+# 只要赎回 + 成交、不要 PnL 子图的 userPositions
+cargo run --example subgraph_spike -- --skip-pnl-positions --out full.json 0xYourWallet...
 ```
+
+全量模式 HTTP 超时约 **300s**；GraphQL 对 timeout / 429 等会做 **最多 3 次**指数退避重试。合并 JSON 里 `_spike_pagination.pagination`：`skip`（redemptions / fills）或 `cursor_id_gt`（userPositions）。
 
 子图文档：[Polymarket Subgraph](https://docs.polymarket.com/market-data/subgraph)
 
