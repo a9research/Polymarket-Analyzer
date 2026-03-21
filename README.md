@@ -353,13 +353,46 @@ docker compose run --rm -v "$(pwd)/out:/out" analyzer \
 
 ---
 
-## 生产部署：Docker 只跑 Postgres + 宿主机 Rust + 域名（示例：api.analyzer.forevex.trade）
+## 极简测试部署（最快，推荐先试）
 
-适用：**数据库用 Docker**，**API 用本机编译的 release 二进制**（便于调试、升级 Rust 而不重建镜像），对外用 **HTTPS 域名**。
+**不用在服务器装 Rust**：用仓库自带 **`docker-compose.yml`** 同时起 **Postgres + API**。
+
+1. 准备一台 Linux VPS，安装 [Docker](https://docs.docker.com/engine/install/) 与 **Docker Compose V2**。
+2. 把代码放到服务器（`git clone` 或上传），进入目录：  
+   `cd polymarket-account-analyzer`
+3. 一键后台启动：  
+   `docker compose up --build -d`
+4. 在云平台安全组 / `ufw` **放行 `3000`**，浏览器或 curl：  
+   `http://你的VPS公网IP:3000/analyze/0x你的钱包地址`  
+   本机在服务器上测：`curl -sS "http://127.0.0.1:3000/analyze/0x..." | head -c 200`
+
+**绑定域名 `api.forevex.trade`（可选，仍可先不配 DNS）：**
+
+- DNS 里给 **`forevex.trade`** 增加子域 **`api`** 的 **A 记录** → VPS 公网 IP（各面板一般填主机记录 **`api`**）。  
+- 验证：`dig +short api.forevex.trade A`  
+- 访问：`http://api.forevex.trade:3000/analyze/...`（同样要放行 **3000**）。
+
+**要上 HTTPS（Let's Encrypt）**：在服务器装 **Caddy**，`Caddyfile` 写两行（API 仍监听本机 `3000`，与 compose 默认一致）：
+
+```caddyfile
+api.forevex.trade {
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+然后 `sudo systemctl reload caddy`（或按 Caddy 文档 reload）。对外即 **`https://api.forevex.trade/analyze/{wallet}`**。前端跨域需配 **`PAA_CORS_ORIGINS`** / `cors_allowed_origins`。
+
+更细说明见 **`documents/deployment-server.mdx`**（文档站「服务器部署」）。
+
+---
+
+## 进阶：Docker 只跑 Postgres + 宿主机 Rust + 域名（api.forevex.trade）
+
+适用：**只想容器跑库**、**API 用本机 `cargo build`** 调试/升级，对外仍可用 **Caddy + `api.forevex.trade`**。
 
 ### 1) DNS
 
-在域名 DNS（Cloudflare / 阿里云等）为 **`api.analyzer.forevex.trade`** 添加 **A 记录** → VPS **公网 IPv4**（有 IPv6 可加 **AAAA**）。生效后用 `dig +short api.analyzer.forevex.trade A` 检查。
+在 DNS 中为 **`api.forevex.trade`** 配置 **A / AAAA** → VPS IP。检查：`dig +short api.forevex.trade A`。
 
 ### 2) 服务器防火墙
 
@@ -400,12 +433,12 @@ export RUST_LOG=info
 安装 [Caddy](https://caddyserver.com/docs/install)，在 `Caddyfile` 中增加：
 
 ```caddyfile
-api.analyzer.forevex.trade {
+api.forevex.trade {
     reverse_proxy 127.0.0.1:3000
 }
 ```
 
-`caddy reload` 后，Caddy 会自动申请 **Let’s Encrypt** 证书。对外地址：`https://api.analyzer.forevex.trade/analyze/{wallet}`。
+`caddy reload` 后，Caddy 会自动申请 **Let’s Encrypt** 证书。对外地址：`https://api.forevex.trade/analyze/{wallet}`。
 
 若浏览器跨域访问，需配置 **`cors_allowed_origins`** / **`PAA_CORS_ORIGINS`**（见上文配置章节）。
 
