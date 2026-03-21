@@ -1793,7 +1793,13 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         }
     }
 
+    async fn health_handler() -> &'static str {
+        // 快速探活：不访问数据库与外部 API；`/analyze` 可能耗时数分钟。
+        "ok"
+    }
+
     let mut app = Router::new()
+        .route("/health", get(health_handler))
         .route("/analyze/:wallet", get(analyze_handler))
         .route("/leaderboard", get(leaderboard_handler))
         .with_state(state);

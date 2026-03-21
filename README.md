@@ -384,6 +384,21 @@ api.forevex.trade {
 
 更细说明见 **`documents/deployment-server.mdx`**（文档站「服务器部署」）。
 
+### 怎么确认在跑？为什么 `curl /analyze` 像「没反应」？
+
+1. **SSH 登录 VPS**，看容器是否在跑：  
+   `cd polymarket-account-analyzer && docker compose ps`  
+   应看到 **`postgres`**、**`analyzer`** 为 `running` / `healthy`。
+2. **看 API 日志**（最有用）：  
+   `docker compose logs -f --tail=80 analyzer`  
+   启动成功时会有 **`listening on 0.0.0.0:3000`**；请求 `/analyze` 时会持续打日志直到算完。
+3. **先测健康检查**（**秒回**，不连数据库、不拉 Data API）：  
+   `curl -v --max-time 5 http://127.0.0.1:3000/health`  
+   应返回 **`ok`**。若本机都失败，说明服务没起来或端口不是 3000。
+4. **`/analyze` 可能很慢**：会从 Polymarket Data API 等拉数据，**几分钟都正常**；`curl` **要等整份 JSON 响应结束**才会把 body 给你，期间终端可能**长时间没有输出**。请加大超时，例如：  
+   `curl -v --max-time 600 "http://127.0.0.1:3000/analyze/0x你的地址" | head -c 500`
+5. **从你电脑访问 `http://54.x.x.x:3000` 一直卡住**：检查云厂商 **安全组入站**、Linux **`sudo ufw status`**，是否放行 **TCP 3000**；可用 `curl -v --max-time 10 http://54.x.x.x:3000/health` 先测（部署了新版本才有 `/health`，旧镜像需 `docker compose up --build -d` 重建）。
+
 ---
 
 ## 进阶：Docker 只跑 Postgres + 宿主机 Rust + 域名（api.forevex.trade）
