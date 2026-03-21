@@ -1,0 +1,31 @@
+# 仅 PostgreSQL（宿主机运行 Rust 二进制，不经 Docker 构建后端）
+#
+# 用法（在 polymarket-account-analyzer/ 目录）：
+#   docker compose -f docker-compose.postgres-only.yml up -d
+#
+# 宿主机连接串（默认密码请在生产修改）：
+#   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/polymarket_analyzer
+#
+# 端口仅绑定 127.0.0.1，避免公网直连数据库；API 由本机 Rust + 反代对外。
+#
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: polymarket_analyzer
+    volumes:
+      - polymarket_pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d polymarket_analyzer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  polymarket_pgdata:

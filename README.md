@@ -345,10 +345,75 @@ docker compose run --rm -v "$(pwd)/out:/out" analyzer \
 |------|------|
 | `Dockerfile` | 多阶段构建 release 二进制；运行时仅 `ca-certificates`（HTTPS） |
 | `docker-compose.yml` | `postgres`（健康检查）+ `analyzer`（默认 `0.0.0.0:3000`） |
+| **`docker-compose.postgres-only.yml`** | **仅 PostgreSQL**；`5432` 绑定 **`127.0.0.1`**，供**宿主机** Rust 连接（不经 Docker 跑后端） |
 | `config.docker.example.toml` | Compose 挂载用 TOML 模板 → `config.docker.toml`（见「配置：TOML、PAA…」） |
 | `.dockerignore` | 缩小构建上下文 |
 
 **生产注意：** 修改默认数据库口令、不要用示例口令；默认 **未** 把 Postgres 端口映射到宿主机；需要本机 `psql` 调试时再在 compose 里打开 `ports`。日志级别：`RUST_LOG=debug docker compose up`。
+
+---
+
+## 生产部署：Docker 只跑 Postgres + 宿主机 Rust + 域名（示例：api.analyzer.forevex.trade）
+
+适用：**数据库用 Docker**，**API 用本机编译的 release 二进制**（便于调试、升级 Rust 而不重建镜像），对外用 **HTTPS 域名**。
+
+### 1) DNS
+
+在域名 DNS（Cloudflare / 阿里云等）为 **`api.analyzer.forevex.trade`** 添加 **A 记录** → VPS **公网 IPv4**（有 IPv6 可加 **AAAA**）。生效后用 `dig +short api.analyzer.forevex.trade A` 检查。
+
+### 2) 服务器防火墙
+
+放行 **22**（SSH）、**80**、**443**。**不要**把 Postgres **5432** 暴露到公网；下文 Compose 仅绑定 **127.0.0.1:5432**。
+
+### 3) 只启动 PostgreSQL
+
+在 **`polymarket-account-analyzer/`** 目录：
+
+```bash
+docker compose -f docker-compose.postgres-only.yml up -d
+```
+
+**生产务必**编辑该文件中的 `POSTGRES_PASSWORD`（及同步到 `DATABASE_URL`）。
+
+宿主机连接串示例：
+
+```bash
+export DATABASE_URL="postgres://postgres:你的强口令@127.0.0.1:5432/polymarket_analyzer"
+```
+
+### 4) 编译并运行 Rust API（监听本机回环）
+
+```bash
+cd polymarket-account-analyzer
+cargo build --release
+export DATABASE_URL="postgres://postgres:你的强口令@127.0.0.1:5432/polymarket_analyzer"
+export RUST_LOG=info
+./target/release/polymarket-account-analyzer serve --bind 127.0.0.1:3000
+```
+
+验证：`curl -sS "http://127.0.0.1:3000/analyze/0x你的地址" | head -c 200`
+
+可选 **`systemd`** 常驻：创建 `polymarket-analyzer.service`，`ExecStart` 指向上述二进制，`Environment=DATABASE_URL=...`，`After=docker.service`。勿将含密码的 unit 提交到 Git。
+
+### 5) 反代 + TLS（Caddy 示例）
+
+安装 [Caddy](https://caddyserver.com/docs/install)，在 `Caddyfile` 中增加：
+
+```caddyfile
+api.analyzer.forevex.trade {
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+`caddy reload` 后，Caddy 会自动申请 **Let’s Encrypt** 证书。对外地址：`https://api.analyzer.forevex.trade/analyze/{wallet}`。
+
+若浏览器跨域访问，需配置 **`cors_allowed_origins`** / **`PAA_CORS_ORIGINS`**（见上文配置章节）。
+
+**Nginx** 亦可：`proxy_pass http://127.0.0.1:3000;`，证书用 **certbot** `--nginx`。
+
+### 6) 文档站（Mintlify）
+
+更完整的步骤（含跨平台编译、安全清单、与全套 Docker 对比）见 monorepo **`documents/deployment-server.mdx`**（在线文档导航 **「服务器部署」**）。
 
 ---
 
@@ -631,6 +696,7 @@ cargo build --release
 | [**`artifacts/manual-test-checklist.md`**](../artifacts/manual-test-checklist.md) | 手工测试清单 |
 | [**`artifacts/progress-log.md`**](../artifacts/progress-log.md) | 按日迭代与验证记录 |
 | [**`artifacts/backlog-waiting.md`**](../artifacts/backlog-waiting.md) | **待解决 / 按需开发**（增量假设、缓存与行表一致性、后续能力） |
+| [**`documents/deployment-server.mdx`**](../documents/deployment-server.mdx) | **生产部署**：Postgres-only Docker、宿主机 Rust、域名与 TLS（文档站同步） |
 | [`task_plan.md`](../task_plan.md)、[`findings.md`](../findings.md)、[`progress.md`](../progress.md) | 任务、决策、进度摘要 |
 
 ---
