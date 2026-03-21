@@ -38,13 +38,13 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       # 以下为可选业务参数（含义见 README「PAA_* 参数说明」）；取消注释即生效
       # Data API 每页条数与翻页步长，1～10000
-      # PAA_TRADES_PAGE_LIMIT: "3000"
+      PAA_TRADES_PAGE_LIMIT: "300"
       # 每页 Data API 请求之间的间隔（毫秒），防限流
-      # PAA_RATE_LIMIT_MS: "200"
+      PAA_RATE_LIMIT_MS: "200"
       # 默认是否拉 Goldsky 子图（true/false）；单次请求仍可用 ?with_subgraph= 覆盖
-      # PAA_SUBGRAPH_ENABLED: "true"
+      PAA_SUBGRAPH_ENABLED: "true"
       # 子图每条流最多翻页数，控制耗时与数据量
-      # PAA_SUBGRAPH_MAX_PAGES: "300"
+      PAA_SUBGRAPH_MAX_PAGES: "20"
     ports:
       - "3000:3000"
     depends_on:
