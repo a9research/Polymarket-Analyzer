@@ -119,10 +119,15 @@ fn outcome_index_from_leg(
 
 /// For each non-zero inventory key, if Gamma payouts exist for that market's slug, add
 /// `shares * (payout - avg_price)`.
+///
+/// **`asset_to_slug`:** `trade_pnl::position_key` uses **only** `asset:{token}` (no `condition_id::`)
+/// when `Trade.asset` is set; those keys never contain `::`, so we resolve slug from this map
+/// (built from the trade stream: last-seen slug per asset id).
 pub fn settlement_breakdown_for_open_book(
     book: &HashMap<String, (f64, f64)>,
     payouts_by_slug: &HashMap<String, GammaResolutionPayouts>,
     condition_to_slug: &HashMap<String, String>,
+    asset_to_slug: &HashMap<String, String>,
 ) -> SettlementBreakdown {
     let mut total = 0.0_f64;
     let mut legs_used = 0_usize;
@@ -133,17 +138,32 @@ pub fn settlement_breakdown_for_open_book(
         if *shares <= 1e-12 || !shares.is_finite() || !avg_price.is_finite() {
             continue;
         }
-        let Some((cid, leg)) = key.split_once("::") else {
+
+        let (slug_opt, leg): (Option<&str>, &str) = if let Some((cid, leg)) = key.split_once("::") {
+            let cid = normalize_condition_id(cid);
+            (
+                condition_to_slug
+                    .get(&cid)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty()),
+                leg,
+            )
+        } else if let Some(rest) = key.strip_prefix("asset:") {
+            let al = rest.trim().to_lowercase();
+            (
+                asset_to_slug
+                    .get(&al)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty()),
+                key.as_str(),
+            )
+        } else {
+            (None, "")
+        };
+
+        let Some(slug) = slug_opt else {
             continue;
         };
-        let cid = normalize_condition_id(cid);
-        let Some(slug) = condition_to_slug.get(&cid) else {
-            continue;
-        };
-        let slug = slug.trim();
-        if slug.is_empty() {
-            continue;
-        }
         let Some(gp) = payouts_by_slug.get(slug) else {
             continue;
         };
@@ -244,8 +264,52 @@ mod tests {
             "some-market".into(),
         );
 
-        let s = settlement_breakdown_for_open_book(&book, &payouts, &cond);
+        let empty_asset: HashMap<String, String> = HashMap::new();
+        let s = settlement_breakdown_for_open_book(&book, &payouts, &cond, &empty_asset);
         assert_eq!(s.legs_used, 1);
         assert!((s.total - 10.0 * (1.0 - 0.4)).abs() < 1e-6);
+    }
+
+    /// Data API 常带 `asset`：`position_key` 为 `asset:{id}`，无 `::`，须用 `asset_to_slug`。
+    #[test]
+    fn settlement_buy_asset_only_key() {
+        use crate::polymarket::data_api::{Trade, TradeSide};
+
+        let token = "999888777666555444333222111000";
+        let trades = vec![Trade {
+            proxy_wallet: None,
+            side: TradeSide::Buy,
+            asset: Some(token.into()),
+            condition_id: "0xdeadbeef".into(),
+            size: 5.0,
+            price: 0.3,
+            timestamp: 1000,
+            title: None,
+            slug: "sport-x".into(),
+            event_slug: None,
+            outcome: Some("Yes".into()),
+            outcome_index: None,
+            transaction_hash: None,
+        }];
+
+        let book = crate::trade_pnl::outcome_book_after_trades(&trades);
+        assert!(book.contains_key(&format!("asset:{token}")));
+
+        let mut payouts: HashMap<String, GammaResolutionPayouts> = HashMap::new();
+        payouts.insert(
+            "sport-x".into(),
+            GammaResolutionPayouts {
+                outcomes: vec!["Yes".into(), "No".into()],
+                payout_by_outcome_index: vec![1.0, 0.0],
+                clob_token_ids: vec![token.into(), "other".into()],
+            },
+        );
+        let cond = HashMap::new();
+        let mut asset_map = HashMap::new();
+        asset_map.insert(token.to_lowercase(), "sport-x".into());
+
+        let s = settlement_breakdown_for_open_book(&book, &payouts, &cond, &asset_map);
+        assert_eq!(s.legs_used, 1);
+        assert!((s.total - 5.0 * (1.0 - 0.3)).abs() < 1e-6);
     }
 }

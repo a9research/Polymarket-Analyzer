@@ -663,7 +663,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-当前发布 **`schema_version: "2.5.0"`**（旧缓存可能仍为 `2.4.0` 及更早）。**2.5**：**`lifetime.net_pnl_settlement`** = 对 **Gamma 已结算**（`closed` + `umaResolutionStatus=resolved` 等）市场，按 **`outcomePrices`** 对**仍持仓**的份额计 `Σ shares×(payout−avg_cost)`（与 `trade_pnl` 同一平均成本账本；无需 SELL）；**`lifetime.net_pnl`** = 单笔 **SELL 已实现** + **`net_pnl_settlement`**；受 **`max_gamma_slugs_for_timing`** 与 slug 拉取上限约束。**2.4**：**`trades_count`** / **`total_trades`** = 不同市场数；**`trades_fill_count`** = `/trades` 行数。**2.3**：已实现口径仍以平均成本、`asset` 键为主。
+当前发布 **`schema_version: "2.5.1"`**（旧缓存可能仍为 `2.5.0` 及更早）。**2.5.1**：结算 PnL 补齐 **`asset:{token}`** 库存键（Data API 常见、无 `condition_id::` 前缀），用成交里 **`asset → slug`** 映射对齐 Gamma。**2.5**：**`net_pnl_settlement`**、**`net_pnl`** 定义见上。**2.4** / **2.3**：略。
 
 | 块 | 说明 |
 |----|------|

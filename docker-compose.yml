@@ -45,6 +45,8 @@ services:
       PAA_SUBGRAPH_ENABLED: "true"
       # 子图每条流最多翻页数，控制耗时与数据量
       PAA_SUBGRAPH_MAX_PAGES: "20"
+      # 报告缓存 TTL（秒），0 禁用
+      PAA_CACHE_TTL_SEC: "86400"
     ports:
       - "3000:3000"
     depends_on:

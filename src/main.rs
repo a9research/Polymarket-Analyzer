@@ -1456,6 +1456,7 @@ fn build_report(
 
     let book = trade_pnl::outcome_book_after_trades(trades);
     let mut condition_to_slug: HashMap<String, String> = HashMap::new();
+    let mut asset_to_slug: HashMap<String, String> = HashMap::new();
     for t in trades {
         if t.slug.trim().is_empty() {
             continue;
@@ -1463,11 +1464,20 @@ fn build_report(
         condition_to_slug
             .entry(normalize_condition_id(&t.condition_id))
             .or_insert_with(|| t.slug.clone());
+        if let Some(ref a) = t.asset {
+            let al = a.trim().to_lowercase();
+            if !al.is_empty() {
+                asset_to_slug
+                    .entry(al)
+                    .or_insert_with(|| t.slug.clone());
+            }
+        }
     }
     let settlement = settlement_breakdown_for_open_book(
         &book,
         &augment.gamma_resolution_by_slug,
         &condition_to_slug,
+        &asset_to_slug,
     );
     let net_pnl_settlement = settlement.total;
     let lifetime_net_pnl = net_pnl_realized_trades + net_pnl_settlement;
@@ -1746,7 +1756,7 @@ fn build_report(
     let open_positions_count = augment.open_positions.len();
 
     AnalyzeReport {
-        schema_version: "2.5.0".to_string(),
+        schema_version: "2.5.1".to_string(),
         wallet: wallet.to_string(),
         trades_count: distinct_slugs_count,
         trades_fill_count: trade_fills_count,
