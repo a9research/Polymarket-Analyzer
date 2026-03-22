@@ -1743,15 +1743,28 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
 
     let storage = init_storage(&cfg).await?;
 
+    let gamma_http = reqwest::Client::builder()
+        .user_agent(concat!("polymarket-account-analyzer/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(cfg.timeout_sec.max(15)))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .no_proxy()
+        .build()?;
+    let gamma_client = GammaApiClient::new(
+        gamma_http,
+        std::time::Duration::from_millis(cfg.rate_limit_ms.max(1)),
+    );
+
     #[derive(Clone)]
     struct AppState {
         cfg: AppConfig,
         storage: Option<Storage>,
+        gamma: GammaApiClient,
     }
 
     let state = AppState {
         cfg: cfg.clone(),
         storage,
+        gamma: gamma_client,
     };
 
     async fn analyze_handler(
@@ -1850,8 +1863,67 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         "ok"
     }
 
+    fn is_valid_analyze_wallet_path(s: &str) -> bool {
+        let s = s.trim();
+        let Some(rest) = s.strip_prefix("0x") else {
+            return false;
+        };
+        rest.len() == 40 && rest.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// 浏览器同源拉 Gamma 会 CORS；由 **Rust** 代拉（与 `/analyze` 相同出网路径，无需本机 VPN/HTTPS_PROXY）。
+    async fn gamma_public_profile_handler(
+        Path(wallet): Path<String>,
+        State(st): State<AppState>,
+    ) -> impl IntoResponse {
+        let w = wallet.trim().to_lowercase();
+        if !is_valid_analyze_wallet_path(&w) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid_address" })),
+            )
+                .into_response();
+        }
+        match st.gamma.fetch_public_profile_response(&w).await {
+            Ok(resp) => {
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let ct = resp
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok());
+                let body = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": format!("gamma public-profile read body: {e:#}")
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+                let mut res = axum::response::Response::new(axum::body::Body::from(body.to_vec()));
+                *res.status_mut() = status;
+                if let Some(ct) = ct {
+                    res.headers_mut().insert(axum::http::header::CONTENT_TYPE, ct);
+                }
+                res.into_response()
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("gamma public-profile fetch: {e:#}")
+                })),
+            )
+                .into_response(),
+        }
+    }
+
     let mut app = Router::new()
         .route("/health", get(health_handler))
+        .route("/gamma-public-profile/:wallet", get(gamma_public_profile_handler))
         .route("/analyze/:wallet", get(analyze_handler))
         .route("/leaderboard", get(leaderboard_handler))
         .with_state(state);

@@ -319,6 +319,9 @@ docker compose up --build -d
 # 健康检查通过后，本机访问 API（钱包地址按实际替换）
 curl -s "http://127.0.0.1:3000/analyze/0x你的钱包地址" | jq .
 
+# Gamma 公开资料（供前端 BFF；与 analyze 同源出网）
+curl -s "http://127.0.0.1:3000/gamma-public-profile/0x你的钱包地址" | jq .
+
 # 子图 + 对账（仅当次 query，不写进镜像）
 curl -s "http://127.0.0.1:3000/analyze/0x你的钱包地址?with_subgraph=true&with_reconciliation=true" | jq .
 

@@ -50,6 +50,22 @@ impl GammaApiClient {
         }
         Ok(resp.json::<PublicProfile>().await?)
     }
+
+    /// Raw `GET /public-profile` for BFF passthrough (preserve 404 / body).
+    pub async fn fetch_public_profile_response(
+        &self,
+        address: &str,
+    ) -> reqwest::Result<reqwest::Response> {
+        let url = format!("{}/public-profile", self.base_url);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("address", address)])
+            .send()
+            .await?;
+        tokio::time::sleep(self.rate_limit).await;
+        Ok(resp)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
