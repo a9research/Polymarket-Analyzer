@@ -662,11 +662,11 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-当前发布 **`schema_version: "2.3.0"`**（旧缓存可能仍为 `2.2.0` / `2.1.0` / `2.0.0`）。**2.3**：`lifetime.net_pnl` 改为**各笔已实现盈亏之和**（与 `max_single_win` / `frontend.*.pnl` 同一套平均成本库存；不再使用「买负卖正」现金流加总，避免与 `total_volume` 在卖量主导时数值接近、误导「净盈亏」）。库存键优先 Data API 的 **`asset`**（outcome token），减少 BUY 带 `outcome`、SELL 仅带 `outcome_index` 时对不上账、单笔已实现全为 0 的情况。
+当前发布 **`schema_version: "2.4.0"`**（旧缓存可能仍为 `2.3.0` 及更早）。**2.4**：**`trades_count`**（及 **`lifetime.total_trades`**）= **不同市场数**：非空 `slug` 去重（小写），`slug` 为空则按 **`condition_id`** 去重——与 Polymarket **`user-stats.trades`** 典型口径一致；**`trades_fill_count`** = Data API **`/trades` 行数**（明细成交笔数）。**2.3**：`lifetime.net_pnl` = Σ 单笔已实现（平均成本库存；库存键优先 **`asset`**）。
 
 | 块 | 说明 |
 |----|------|
-| **`lifetime`** | **`net_pnl`**（2.3+）= Σ 单笔已实现；`total_volume` = Σ `size*price`（名义成交额）；`total_trades` 等；**`max_single_win` / `max_single_loss`** 为单笔**已实现**极值；另含 `open_position_value`、**`closed_realized_pnl_sum`**、**`open_positions_count`** |
+| **`lifetime`** | **`net_pnl`**（2.3+）= Σ 单笔已实现；`total_volume` = Σ `size*price`；**`total_trades`**（2.4+）= 不同 slug/条件数（同根 `trades_count`）；**`max_single_win` / `max_single_loss`**；`open_position_value`、**`closed_realized_pnl_sum`**、**`open_positions_count`** |
 | **`time_analysis`** | **`entry_to_resolution_seconds`**（有 Gamma 解析时填充）、**`entry_to_resolution_p50_sec` / `p90_sec`**、`metadata_missing_ratio` 按样本比例更新 |
 | **`trading_patterns`** | **`grid_like_market_ratio`**、**`win_rate_closed_positions`**（样本 ≥5 时）、**`closed_positions_sample_size`** |
 | **`strategy_inference`** | `src/strategy.rs`：**`high-frequency-grid-scalper`**（网格占比 >20% 且 entry P90 < 60s 等）；**`rule_json`** 含 `entry_window_sec_avg`、`preferred_price_ranges`、`jackpot_bias`、`multi_window_count` 等；更长的 **pseudocode** |
@@ -674,7 +674,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 | **`frontend`** | **`biggest_wins` / `biggest_losses`**（按 **`pnl`** 排序：单笔**已实现**盈亏，平均成本法；买为 0）、**`recent_trades`**、**`current_positions`**、**`ai_copy_prompt`** |
 | **`gamma_profile`** | Gamma **`/public-profile`**：`display_name`、`username`、`avatar_url`、`created_at`、`bio`、`verified_badge`、`proxy_wallet`、`x_username`（有则填） |
 
-仍包含：`wallet`、`trades_count`、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`（原字段）、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。
+仍包含：`wallet`、**`trades_count`**（2.4+ 为市场数）、**`trades_fill_count`**（2.4+）、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。
 
 ---
 
@@ -685,7 +685,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 | 类别 | 表 |
 |------|-----|
 | 报告缓存 | **`report_cache_kv`**（主）；`analyze_report_cache`（仅 legacy 读） |
-| 前端 / 榜单 | **`wallet_trade_pnl`**（每笔 `pnl` + 成交字段，按 `cache_key` 覆盖写入）；**`wallet_leaderboard_stats`**（按 `lifetime.net_pnl` 排名，每次 analyze 写缓存时 upsert） |
+| 前端 / 榜单 | **`wallet_trade_pnl`**（每笔 `pnl` + 成交字段，按 `cache_key` 覆盖写入）；**`wallet_leaderboard_stats`**（按 `lifetime.net_pnl` 排名；**`trades_count` 列** 2.4+ 与报告一致为**市场数**，非 `/trades` 行数） |
 | 任务与 Raw | `ingestion_run`、`raw_ingestion_chunk`、`raw_data_api_trades`、**`raw_data_api_open_positions`**、**`raw_data_api_closed_positions`**、`raw_subgraph_*` |
 | 维表 | `markets_dim` |
 | 规范与对账 | `canonical_events`、`source_event_map`、`reconciliation_report`、`reconciliation_ambiguous_queue` |

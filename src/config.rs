@@ -332,36 +332,55 @@ pub struct MarketTypeConfig {
     pub rules: Vec<MarketTypeRule>,
 }
 
+fn default_market_type_sports_prefixes() -> Vec<MarketTypeRule> {
+    // Common Polymarket slug prefixes (football / US sports); prefix rules run before substring rules.
+    const PREFIXES: &[&str] = &[
+        "epl-", "ucl-", "uel-", "fl1-", "mls-", "bun-", "cdr-", "elc-", "ere-", "ita-", "por-",
+        "spl-", "spfl-", "sea-", "lig-", "j1-", "j2-", "k1-", "csl-", "ered-", "ligue-", "prem-",
+        "nfl-", "nba-", "nhl-", "mlb-", "ncaa-", "wnba-", "atp-", "wta-", "ufc-", "mma-",
+        "fif-", "afc-", "caf-", "con-", "uef-", "lib-", "cwc-", "copa-", "euro-", "eth-", "brz-",
+    ];
+    PREFIXES
+        .iter()
+        .map(|p| MarketTypeRule::Prefix {
+            prefix: (*p).to_string(),
+            r#type: "sports".to_string(),
+        })
+        .collect()
+}
+
 impl Default for MarketTypeConfig {
     fn default() -> Self {
+        let mut rules = default_market_type_sports_prefixes();
+        rules.extend([
+            MarketTypeRule::Contains {
+                contains: "5-min".to_string(),
+                r#type: "5-min".to_string(),
+            },
+            MarketTypeRule::Contains {
+                contains: "1h".to_string(),
+                r#type: "1h".to_string(),
+            },
+            MarketTypeRule::Contains {
+                contains: "daily".to_string(),
+                r#type: "daily".to_string(),
+            },
+            MarketTypeRule::Contains {
+                contains: "politics".to_string(),
+                r#type: "politics".to_string(),
+            },
+            MarketTypeRule::Contains {
+                contains: "sports".to_string(),
+                r#type: "sports".to_string(),
+            },
+            MarketTypeRule::Contains {
+                contains: "crypto".to_string(),
+                r#type: "crypto".to_string(),
+            },
+        ]);
         Self {
             default_type: "unknown".to_string(),
-            rules: vec![
-                MarketTypeRule::Contains {
-                    contains: "5-min".to_string(),
-                    r#type: "5-min".to_string(),
-                },
-                MarketTypeRule::Contains {
-                    contains: "1h".to_string(),
-                    r#type: "1h".to_string(),
-                },
-                MarketTypeRule::Contains {
-                    contains: "daily".to_string(),
-                    r#type: "daily".to_string(),
-                },
-                MarketTypeRule::Contains {
-                    contains: "politics".to_string(),
-                    r#type: "politics".to_string(),
-                },
-                MarketTypeRule::Contains {
-                    contains: "sports".to_string(),
-                    r#type: "sports".to_string(),
-                },
-                MarketTypeRule::Contains {
-                    contains: "crypto".to_string(),
-                    r#type: "crypto".to_string(),
-                },
-            ],
+            rules,
         }
     }
 }
@@ -375,12 +394,16 @@ pub enum MarketTypeRule {
 
 impl MarketTypeConfig {
     pub fn classify_slug<'a>(&'a self, slug: &str) -> &'a str {
+        let slug_lc = slug.to_lowercase();
         for rule in &self.rules {
             match rule {
-                MarketTypeRule::Contains { contains, r#type } if slug.contains(contains) => {
-                    return r#type.as_str();
+                MarketTypeRule::Prefix { prefix, r#type } => {
+                    let pfx = prefix.to_lowercase();
+                    if slug_lc.starts_with(&pfx) {
+                        return r#type.as_str();
+                    }
                 }
-                MarketTypeRule::Prefix { prefix, r#type } if slug.starts_with(prefix) => {
+                MarketTypeRule::Contains { contains, r#type } if slug_lc.contains(&contains.to_lowercase()) => {
                     return r#type.as_str();
                 }
                 _ => {}

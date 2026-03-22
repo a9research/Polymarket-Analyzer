@@ -1398,6 +1398,20 @@ fn build_report(
     augment: &ReportAugment,
 ) -> AnalyzeReport {
     let per_trade_pnl = trade_pnl::per_trade_realized_pnl(trades);
+    let trade_fills_count = trades.len();
+    let distinct_slugs_count = trades
+        .iter()
+        .map(|t| {
+            let s = t.slug.trim();
+            if s.is_empty() {
+                format!("cid:{}", t.condition_id.to_lowercase())
+            } else {
+                s.to_lowercase()
+            }
+        })
+        .collect::<HashSet<_>>()
+        .len();
+    let fill_denom = trade_fills_count.max(1);
     let lifetime_net_pnl: f64 = per_trade_pnl.iter().sum();
     let mut total_volume = 0.0_f64;
     let max_single_win;
@@ -1492,7 +1506,6 @@ fn build_report(
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(0.0);
 
-    let total_trades = trades.len().max(1);
     let total_volume_nonzero = if total_volume == 0.0 { 1.0 } else { total_volume };
     let mut market_distribution: Vec<MarketDistributionItem> = dist
         .into_iter()
@@ -1501,7 +1514,7 @@ fn build_report(
             trades: cnt,
             volume: vol,
             pnl,
-            trades_pct: (cnt as f64 / total_trades as f64) * 100.0,
+            trades_pct: (cnt as f64 / fill_denom as f64) * 100.0,
             volume_pct: (vol / total_volume_nonzero) * 100.0,
         })
         .collect();
@@ -1672,16 +1685,17 @@ fn build_report(
     let open_positions_count = augment.open_positions.len();
 
     AnalyzeReport {
-        schema_version: "2.3.0".to_string(),
+        schema_version: "2.4.0".to_string(),
         wallet: wallet.to_string(),
-        trades_count: trades.len(),
+        trades_count: distinct_slugs_count,
+        trades_fill_count: trade_fills_count,
         total_volume,
         data_fetch: DataFetchMeta {
             truncated,
             max_offset_allowed,
         },
         lifetime: LifetimeMetrics {
-            total_trades: trades.len(),
+            total_trades: distinct_slugs_count,
             total_volume,
             net_pnl: lifetime_net_pnl,
             open_position_value,
@@ -1717,6 +1731,10 @@ fn build_report(
         notes: {
             let mut notes = vec![
                 "lifetime.net_pnl: sum of per-trade realized PnL (avg-cost inventory; asset/outcome keying); closed_realized_pnl_sum from /closed-positions for cross-check; open_position_value from /positions; entry P50/P90 use Gamma resolution times (capped slugs).".into(),
+                format!(
+                    "trades_count (2.4+)=distinct markets (unique slug, else condition_id), aligned with Polymarket user-stats.trades; trades_fill_count={} is Data API /trades row count.",
+                    trade_fills_count
+                ),
             ];
             if truncated {
                 notes.push(format!(

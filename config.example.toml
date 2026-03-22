@@ -80,23 +80,5 @@ enabled = false
 
 [market_type]
 default_type = "unknown"
-
-[[market_type.rules]]
-kind = "contains"
-contains = "5-min"
-type = "5-min"
-
-[[market_type.rules]]
-kind = "contains"
-contains = "1h"
-type = "1h"
-
-[[market_type.rules]]
-kind = "contains"
-contains = "daily"
-type = "daily"
-
-[[market_type.rules]]
-kind = "contains"
-contains = "politics"
-type = "politics"
+# 不在此文件写 [[market_type.rules]] 时，合并后使用代码内置规则（体育 slug 前缀 epl-/ucl-/mls-/nfl-… → sports，再加 5-min/1h/daily/politics/sports/crypto 等子串规则）。
+# 若在此文件声明任意 [[market_type.rules]]，将**整表替换**内置列表，请自行补全所需 Prefix/Contains。

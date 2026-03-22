@@ -194,7 +194,12 @@ pub struct AnalyzeReport {
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
     pub wallet: String,
+    /// Distinct markets: unique non-empty `slug` (else `condition_id`), aligned with Polymarket
+    /// `user-stats.trades` for typical accounts.
     pub trades_count: usize,
+    /// Raw Data API `/trades` row count (fills / executions).
+    #[serde(default)]
+    pub trades_fill_count: usize,
     pub total_volume: f64,
     pub lifetime: LifetimeMetrics,
     pub market_distribution: Vec<MarketDistributionItem>,
