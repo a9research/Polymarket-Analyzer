@@ -239,6 +239,9 @@ pub struct AnalyzeReport {
     pub frontend: Option<FrontendPresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gamma_profile: Option<GammaProfileSummary>,
+    /// RFC3339 UTC: set on fresh `build_report`; on cache read, overwritten from Postgres `updated_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

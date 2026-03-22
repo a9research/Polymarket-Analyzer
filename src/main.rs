@@ -287,6 +287,9 @@ impl From<&AnalyzeCliFlags> for AnalyzeOverrides {
 struct AnalyzeQuery {
     #[serde(default)]
     no_cache: bool,
+    /// Return only a Postgres-cached report (no full pipeline). 404 if miss.
+    #[serde(default)]
+    cached_only: bool,
     #[serde(default)]
     with_subgraph: bool,
     #[serde(default)]
@@ -610,6 +613,111 @@ async fn report_from_canonical_pg_run(
     Ok(report)
 }
 
+/// Incremental trades + snapshot refresh after a cache hit (runs off the HTTP critical path).
+async fn wallet_refresh_after_cache_hit(
+    store: Storage,
+    cfg: AppConfig,
+    wallet_lc: String,
+    cache_key: String,
+    cached: AnalyzeReport,
+) {
+    if !cfg.ingestion.persist_wallet_snapshots {
+        return;
+    }
+    let mut refreshed_trades_on_hit = false;
+    if cfg.ingestion.data_api_incremental_trades {
+        let prev = store
+            .fetch_wallet_primary_trades(&wallet_lc)
+            .await
+            .unwrap_or_default();
+        if let Some(wm) = wallet_trades_watermark_ms(&prev) {
+            let timeout = Duration::from_secs(cfg.timeout_sec.max(10));
+            let Ok(http_hit) = Client::builder()
+                .user_agent("polymarket-account-analyzer/0.1")
+                .timeout(timeout)
+                .connect_timeout(Duration::from_secs(15))
+                .no_proxy()
+                .build()
+            else {
+                tracing::warn!("cache-hit refresh: build http client failed");
+                return;
+            };
+            let rate_hit = Duration::from_millis(cfg.rate_limit_ms);
+            let data_hit = DataApiClient::new(http_hit, rate_hit);
+            if let Ok((delta, _, _)) = data_hit
+                .trades_since_watermark(
+                    &wallet_lc,
+                    cfg.trades_page_limit,
+                    wm,
+                    cfg.ingestion.data_api_incremental_max_pages,
+                )
+                .await
+            {
+                if !delta.is_empty() {
+                    let merged = merge_trades_incremental(prev, delta);
+                    let pnls = trade_pnl::per_trade_realized_pnl(&merged);
+                    let canon = store
+                        .fetch_wallet_canonical_event_rows(&wallet_lc)
+                        .await
+                        .unwrap_or_default();
+                    let canon_opt = if canon.is_empty() {
+                        None
+                    } else {
+                        Some(canon.as_slice())
+                    };
+                    let snap_meta = WalletPipelineSnapshotMeta {
+                        last_ingestion_run_id: cached
+                            .ingestion
+                            .as_ref()
+                            .and_then(|i| i.run_id.clone()),
+                        analytics_lane: cached
+                            .data_lineage
+                            .as_ref()
+                            .map(|d| d.analytics_primary_source.clone())
+                            .unwrap_or_else(|| "data_api_trades".to_string()),
+                        cache_key: cache_key.clone(),
+                        schema_version: cached.schema_version.clone(),
+                        data_api_truncated: cached.data_fetch.truncated,
+                        data_api_max_offset_allowed: cached
+                            .data_fetch
+                            .max_offset_allowed
+                            .and_then(|x| i32::try_from(x).ok()),
+                        data_api_trade_watermark_ms: merged
+                            .iter()
+                            .map(|t| trade_timestamp_ms(t.timestamp))
+                            .max(),
+                    };
+                    if let Err(e) = store
+                        .replace_wallet_pipeline_snapshots(
+                            &wallet_lc,
+                            &snap_meta,
+                            &merged,
+                            &pnls,
+                            canon_opt,
+                            &cached,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "replace_wallet_pipeline_snapshots (cache-hit incremental): {e:#}"
+                        );
+                    } else {
+                        refreshed_trades_on_hit = true;
+                    }
+                }
+            }
+        }
+    }
+    if !refreshed_trades_on_hit {
+        if let Err(e) = store
+            .refresh_wallet_snapshots_after_cache_hit(&wallet_lc, &cache_key, &cached)
+            .await
+        {
+            tracing::warn!("refresh_wallet_snapshots_after_cache_hit: {e:#}");
+        }
+    }
+}
+
 async fn analyze_wallet(
     cfg: &AppConfig,
     storage: Option<&Storage>,
@@ -626,94 +734,15 @@ async fn analyze_wallet(
                 .await?
             {
                 if cfg.ingestion.persist_wallet_snapshots {
-                    let mut refreshed_trades_on_hit = false;
-                    if cfg.ingestion.data_api_incremental_trades {
-                        let prev = store
-                            .fetch_wallet_primary_trades(&w)
-                            .await
-                            .unwrap_or_default();
-                        if let Some(wm) = wallet_trades_watermark_ms(&prev) {
-                            let timeout = Duration::from_secs(cfg.timeout_sec.max(10));
-                            let http_hit = Client::builder()
-                                .user_agent("polymarket-account-analyzer/0.1")
-                                .timeout(timeout)
-                                .connect_timeout(Duration::from_secs(15))
-                                .no_proxy()
-                                .build()?;
-                            let rate_hit = Duration::from_millis(cfg.rate_limit_ms);
-                            let data_hit = DataApiClient::new(http_hit, rate_hit);
-                            if let Ok((delta, _, _)) = data_hit
-                                .trades_since_watermark(
-                                    &w,
-                                    cfg.trades_page_limit,
-                                    wm,
-                                    cfg.ingestion.data_api_incremental_max_pages,
-                                )
-                                .await
-                            {
-                                if !delta.is_empty() {
-                                    let merged = merge_trades_incremental(prev, delta);
-                                    let pnls = trade_pnl::per_trade_realized_pnl(&merged);
-                                    let canon = store
-                                        .fetch_wallet_canonical_event_rows(&w)
-                                        .await
-                                        .unwrap_or_default();
-                                    let canon_opt = if canon.is_empty() {
-                                        None
-                                    } else {
-                                        Some(canon.as_slice())
-                                    };
-                                    let snap_meta = WalletPipelineSnapshotMeta {
-                                        last_ingestion_run_id: cached
-                                            .ingestion
-                                            .as_ref()
-                                            .and_then(|i| i.run_id.clone()),
-                                        analytics_lane: cached
-                                            .data_lineage
-                                            .as_ref()
-                                            .map(|d| d.analytics_primary_source.clone())
-                                            .unwrap_or_else(|| "data_api_trades".to_string()),
-                                        cache_key: cache_key.clone(),
-                                        schema_version: cached.schema_version.clone(),
-                                        data_api_truncated: cached.data_fetch.truncated,
-                                        data_api_max_offset_allowed: cached
-                                            .data_fetch
-                                            .max_offset_allowed
-                                            .and_then(|x| i32::try_from(x).ok()),
-                                        data_api_trade_watermark_ms: merged
-                                            .iter()
-                                            .map(|t| trade_timestamp_ms(t.timestamp))
-                                            .max(),
-                                    };
-                                    if let Err(e) = store
-                                        .replace_wallet_pipeline_snapshots(
-                                            &w,
-                                            &snap_meta,
-                                            &merged,
-                                            &pnls,
-                                            canon_opt,
-                                            &cached,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "replace_wallet_pipeline_snapshots (cache-hit incremental): {e:#}"
-                                        );
-                                    } else {
-                                        refreshed_trades_on_hit = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !refreshed_trades_on_hit {
-                        if let Err(e) = store
-                            .refresh_wallet_snapshots_after_cache_hit(&w, &cache_key, &cached)
-                            .await
-                        {
-                            tracing::warn!("refresh_wallet_snapshots_after_cache_hit: {e:#}");
-                        }
-                    }
+                    let store_cl = store.clone();
+                    let cfg_cl = cfg.clone();
+                    let w_cl = w.clone();
+                    let ck_cl = cache_key.clone();
+                    let cached_cl = cached.clone();
+                    tokio::spawn(async move {
+                        wallet_refresh_after_cache_hit(store_cl, cfg_cl, w_cl, ck_cl, cached_cl)
+                            .await;
+                    });
                 }
                 return Ok(cached);
             }
@@ -1746,6 +1775,7 @@ fn build_report(
             }
             notes
         },
+        report_updated_at: Some(Utc::now().to_rfc3339()),
     }
 }
 
@@ -1791,15 +1821,51 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         State(st): State<AppState>,
     ) -> impl IntoResponse {
         let cfg = effective_config(&st.cfg, &AnalyzeOverrides::from(&q));
-        match analyze_wallet(&cfg, st.storage.as_ref(), &wallet, q.no_cache).await {
-            Ok(report) => (StatusCode::OK, Json(report)).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("{:#}", e)
-                })),
-            )
-                .into_response(),
+        if q.cached_only {
+            if q.no_cache {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "cached_only is incompatible with no_cache"
+                    })),
+                )
+                    .into_response();
+            }
+            let Some(ref store) = st.storage else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "cache_miss" })),
+                )
+                    .into_response();
+            };
+            let cache_key = report_cache_key(&wallet, &cfg);
+            match store
+                .get_cached_report(&cache_key, &wallet, cfg.cache_ttl_sec as i64)
+                .await
+            {
+                Ok(Some(report)) => (StatusCode::OK, Json(report)).into_response(),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "cache_miss" })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("{:#}", e) })),
+                )
+                    .into_response(),
+            }
+        } else {
+            match analyze_wallet(&cfg, st.storage.as_ref(), &wallet, q.no_cache).await {
+                Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("{:#}", e)
+                    })),
+                )
+                    .into_response(),
+            }
         }
     }
 

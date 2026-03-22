@@ -592,7 +592,7 @@ impl Storage {
     ) -> anyhow::Result<Option<AnalyzeReport>> {
         let row = sqlx::query(
             r#"
-            SELECT report_json
+            SELECT report_json, updated_at
             FROM report_cache_kv
             WHERE cache_key = $1
               AND updated_at > NOW() - ($2::bigint * INTERVAL '1 second')
@@ -606,13 +606,15 @@ impl Storage {
 
         if let Some(row) = row {
             let value: serde_json::Value = row.try_get("report_json")?;
-            let report: AnalyzeReport = serde_json::from_value(value)?;
+            let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+            let mut report: AnalyzeReport = serde_json::from_value(value)?;
+            report.report_updated_at = Some(updated_at.to_rfc3339());
             return Ok(Some(report));
         }
 
         let row = sqlx::query(
             r#"
-            SELECT report_json
+            SELECT report_json, updated_at
             FROM analyze_report_cache
             WHERE wallet = $1
               AND updated_at > NOW() - ($2::bigint * INTERVAL '1 second')
@@ -629,7 +631,9 @@ impl Storage {
         };
 
         let value: serde_json::Value = row.try_get("report_json")?;
-        let report: AnalyzeReport = serde_json::from_value(value)?;
+        let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+        let mut report: AnalyzeReport = serde_json::from_value(value)?;
+        report.report_updated_at = Some(updated_at.to_rfc3339());
         Ok(Some(report))
     }
 

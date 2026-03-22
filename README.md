@@ -569,13 +569,14 @@ cargo run --release -- report-from-canonical-run "550e8400-..." --out replay.jso
 
 **CORS（浏览器直连 VPS）：** 配置顶层 **`cors_allowed_origins`**（逗号分隔），或环境变量 **`PAA_CORS_ORIGINS`**（例如 `https://stats.example.com,http://localhost:3000`）。为空则**不**挂载 CORS 中间件。
 
-`GET /analyze/:wallet`：`wallet` 为路径参数，**不要**对 `0x` 地址再做一层 URL 编码破坏路径，一般直接写即可。
+`GET /analyze/:wallet`：`wallet` 为路径参数，**不要**对 `0x` 地址再做一层 URL 编码破坏路径，一般直接写即可。**命中** Postgres 报告缓存时，响应会**立即**返回缓存 JSON；增量刷新 `wallet_*` 快照在**后台任务**中执行，不再阻塞该次 HTTP。
 
 **Query 参数**（与 `Analyze` CLI 覆盖一致，均为可选；布尔值常用 `true` / `false`）：
 
 | 参数 | 说明 |
 |------|------|
 | `no_cache` | 跳过报告缓存 |
+| `cached_only` | **仅**读 Postgres 报告缓存；命中返回 200 JSON，未命中 **404** `{"error":"cache_miss"}`；与 `no_cache` 互斥。供前端「先交付缓存、后台全量重算」 |
 | `with_subgraph` / `no_subgraph` | 子图开关 |
 | `subgraph_cap_rows` | 子图每流行数上限（整数，同 CLI） |
 | `with_reconciliation` / `no_reconciliation` | 对账开关 |
@@ -674,7 +675,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 | **`frontend`** | **`biggest_wins` / `biggest_losses`**（按 **`pnl`** 排序：单笔**已实现**盈亏，平均成本法；买为 0）、**`recent_trades`**、**`current_positions`**、**`ai_copy_prompt`** |
 | **`gamma_profile`** | Gamma **`/public-profile`**：`display_name`、`username`、`avatar_url`、`created_at`、`bio`、`verified_badge`、`proxy_wallet`、`x_username`（有则填） |
 
-仍包含：`wallet`、**`trades_count`**（2.4+ 为市场数）、**`trades_fill_count`**（2.4+）、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。
+仍包含：`wallet`、**`trades_count`**（2.4+ 为市场数）、**`trades_fill_count`**（2.4+）、**`report_updated_at`**（RFC3339 UTC：新算为生成时刻；读缓存时取 PG `updated_at`）、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。
 
 ---
 
