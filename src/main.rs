@@ -310,6 +310,9 @@ struct LeaderboardQuery {
     /// 1–100, default 30.
     #[serde(default)]
     limit: Option<i64>,
+    /// `all` (default) uses lifetime snapshot table; `today` UTC day; `week` / `month` rolling windows on cached per-trade rows.
+    #[serde(default)]
+    period: Option<String>,
 }
 
 impl From<&AnalyzeQuery> for AnalyzeOverrides {
@@ -822,7 +825,12 @@ async fn analyze_wallet(
         Ok(p) => Some(GammaProfileSummary {
             display_name: p.name.clone().or_else(|| p.pseudonym.clone()),
             username: p.pseudonym.clone().or_else(|| p.x_username.clone()),
-            avatar_url: p.profile_image,
+            avatar_url: p.profile_image.clone(),
+            created_at: p.created_at.clone(),
+            bio: p.bio.clone(),
+            verified_badge: p.verified_badge,
+            proxy_wallet: p.proxy_wallet.clone(),
+            x_username: p.x_username.clone(),
         }),
         Err(e) => {
             tracing::debug!("gamma public-profile: {e:#}");
@@ -1390,8 +1398,8 @@ fn build_report(
     augment: &ReportAugment,
 ) -> AnalyzeReport {
     let per_trade_pnl = trade_pnl::per_trade_realized_pnl(trades);
+    let lifetime_net_pnl: f64 = per_trade_pnl.iter().sum();
     let mut total_volume = 0.0_f64;
-    let mut net_pnl = 0.0_f64;
     let max_single_win;
     let max_single_loss;
     let mut price_buckets: BTreeMap<String, usize> = BTreeMap::from([
@@ -1420,7 +1428,6 @@ fn build_report(
             TradeSide::Buy => -volume,
             TradeSide::Sell => volume,
         };
-        net_pnl += cash_flow;
 
         match t.side {
             TradeSide::Buy => buy_count += 1,
@@ -1665,7 +1672,7 @@ fn build_report(
     let open_positions_count = augment.open_positions.len();
 
     AnalyzeReport {
-        schema_version: "2.2.0".to_string(),
+        schema_version: "2.3.0".to_string(),
         wallet: wallet.to_string(),
         trades_count: trades.len(),
         total_volume,
@@ -1676,7 +1683,7 @@ fn build_report(
         lifetime: LifetimeMetrics {
             total_trades: trades.len(),
             total_volume,
-            net_pnl,
+            net_pnl: lifetime_net_pnl,
             open_position_value,
             max_single_win,
             max_single_loss,
@@ -1709,7 +1716,7 @@ fn build_report(
         gamma_profile: augment.gamma_profile.clone(),
         notes: {
             let mut notes = vec![
-                "net_pnl: per-trade cash flow; closed_realized_pnl_sum from /closed-positions; open_position_value from /positions; entry P50/P90 use Gamma resolution times (capped slugs).".into(),
+                "lifetime.net_pnl: sum of per-trade realized PnL (avg-cost inventory; asset/outcome keying); closed_realized_pnl_sum from /closed-positions for cross-check; open_position_value from /positions; entry P50/P90 use Gamma resolution times (capped slugs).".into(),
             ];
             if truncated {
                 notes.push(format!(
@@ -1770,6 +1777,13 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         State(st): State<AppState>,
     ) -> impl IntoResponse {
         let limit = q.limit.unwrap_or(30).clamp(1, 100);
+        let period = q
+            .period
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("all")
+            .to_ascii_lowercase();
         let Some(ref store) = st.storage else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1779,10 +1793,48 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
             )
                 .into_response();
         };
-        match store.fetch_leaderboard(limit).await {
+
+        use chrono::{Duration, TimeZone, Utc};
+
+        let res = if period == "all" || period == "lifetime" {
+            store.fetch_leaderboard(limit).await
+        } else {
+            let cutoff_ms: Option<i64> = match period.as_str() {
+                "today" | "day" | "daily" => {
+                    let nd = Utc::now().date_naive();
+                    nd.and_hms_opt(0, 0, 0)
+                        .map(|t| Utc.from_utc_datetime(&t).timestamp_millis())
+                }
+                "week" | "weekly" => {
+                    let t = Utc::now() - Duration::days(7);
+                    Some(t.timestamp_millis())
+                }
+                "month" | "monthly" => {
+                    let t = Utc::now() - Duration::days(30);
+                    Some(t.timestamp_millis())
+                }
+                _ => None,
+            };
+            match cutoff_ms {
+                Some(cm) => store.fetch_leaderboard_since_trade_ts(limit, cm).await,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "invalid period '{period}'; use all, today, week, or month"
+                            )
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        match res {
             Ok(rows) => (
                 StatusCode::OK,
-                Json(serde_json::json!({ "items": rows })),
+                Json(serde_json::json!({ "items": rows, "period": period })),
             )
                 .into_response(),
             Err(e) => (

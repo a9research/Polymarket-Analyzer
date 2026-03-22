@@ -562,7 +562,7 @@ cargo run --release -- report-from-canonical-run "550e8400-..." --out replay.jso
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | **`/analyze/:wallet`** | 完整 `AnalyzeReport` JSON |
-| `GET` | **`/leaderboard`** | 首页榜单（需 **Postgres**）；Query：`limit` 默认 30，范围 1～100 |
+| `GET` | **`/leaderboard`** | 首页榜单（需 **Postgres**）；Query：`limit` 默认 30（1～100）；`period`：`all`（默认，生涯快照表）、`today`（UTC 自然日起）、`week` / `month`（最近 7 / 30 天，按 `wallet_trade_pnl` 时间戳聚合，且仅统计与 `wallet_leaderboard_stats.cache_key` 一致的行） |
 
 **CORS（浏览器直连 VPS）：** 配置顶层 **`cors_allowed_origins`**（逗号分隔），或环境变量 **`PAA_CORS_ORIGINS`**（例如 `https://stats.example.com,http://localhost:3000`）。为空则**不**挂载 CORS 中间件。
 
@@ -585,6 +585,7 @@ curl -s "http://127.0.0.1:3000/analyze/0x...?no_cache=true" | jq .
 curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&with_reconciliation=true" | jq .
 curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_rows=500" | jq .
 curl -s "http://127.0.0.1:3000/leaderboard?limit=20" | jq .
+curl -s "http://127.0.0.1:3000/leaderboard?limit=20&period=today" | jq .
 ```
 
 > **说明：** 当前 **没有** 与 `report-from-canonical-run`、`export-ambiguous`、`set-ambiguous-review` 等价的 HTTP 接口；这些仅 CLI。
@@ -658,17 +659,17 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-当前发布 **`schema_version: "2.2.0"`**（旧缓存可能仍为 `2.1.0` / `2.0.0`）。在 2.1 基础上新增 / 强化：
+当前发布 **`schema_version: "2.3.0"`**（旧缓存可能仍为 `2.2.0` / `2.1.0` / `2.0.0`）。**2.3**：`lifetime.net_pnl` 改为**各笔已实现盈亏之和**（与 `max_single_win` / `frontend.*.pnl` 同一套平均成本库存；不再使用「买负卖正」现金流加总，避免与 `total_volume` 在卖量主导时数值接近、误导「净盈亏」）。库存键优先 Data API 的 **`asset`**（outcome token），减少 BUY 带 `outcome`、SELL 仅带 `outcome_index` 时对不上账、单笔已实现全为 0 的情况。
 
 | 块 | 说明 |
 |----|------|
-| **`lifetime`** | `net_pnl` / `total_volume` / `total_trades` 等；**`max_single_win` / `max_single_loss`**（2.2+）为单笔**已实现 `pnl`** 极值；另含 `open_position_value`、**`closed_realized_pnl_sum`**、**`open_positions_count`** |
+| **`lifetime`** | **`net_pnl`**（2.3+）= Σ 单笔已实现；`total_volume` = Σ `size*price`（名义成交额）；`total_trades` 等；**`max_single_win` / `max_single_loss`** 为单笔**已实现**极值；另含 `open_position_value`、**`closed_realized_pnl_sum`**、**`open_positions_count`** |
 | **`time_analysis`** | **`entry_to_resolution_seconds`**（有 Gamma 解析时填充）、**`entry_to_resolution_p50_sec` / `p90_sec`**、`metadata_missing_ratio` 按样本比例更新 |
 | **`trading_patterns`** | **`grid_like_market_ratio`**、**`win_rate_closed_positions`**（样本 ≥5 时）、**`closed_positions_sample_size`** |
 | **`strategy_inference`** | `src/strategy.rs`：**`high-frequency-grid-scalper`**（网格占比 >20% 且 entry P90 < 60s 等）；**`rule_json`** 含 `entry_window_sec_avg`、`preferred_price_ranges`、`jackpot_bias`、`multi_window_count` 等；更长的 **pseudocode** |
 | **`price_buckets_chart`** | 固定区间 + `label`（`<0.1`、`0.1–0.3`…），便于前端图表轴一致 |
 | **`frontend`** | **`biggest_wins` / `biggest_losses`**（按 **`pnl`** 排序：单笔**已实现**盈亏，平均成本法；买为 0）、**`recent_trades`**、**`current_positions`**、**`ai_copy_prompt`** |
-| **`gamma_profile`** | Gamma **`/public-profile`**：`display_name`、`username`、`avatar_url`（有则填） |
+| **`gamma_profile`** | Gamma **`/public-profile`**：`display_name`、`username`、`avatar_url`、`created_at`、`bio`、`verified_badge`、`proxy_wallet`、`x_username`（有则填） |
 
 仍包含：`wallet`、`trades_count`、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`（原字段）、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。
 

@@ -81,5 +81,14 @@ pub struct PublicProfile {
     pub profile_image: Option<String>,
     #[serde(default)]
     pub x_username: Option<String>,
+    /// ISO 8601 when the profile was created (Gamma schema).
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub bio: Option<String>,
+    #[serde(default)]
+    pub verified_badge: Option<bool>,
+    #[serde(default)]
+    pub proxy_wallet: Option<String>,
 }
 

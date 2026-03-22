@@ -368,7 +368,12 @@ async fn paginate_order_fills(
             Ok(r) => return Ok(r),
             Err(e) => {
                 let msg = format!("{e:#}");
-                if msg.contains("Cannot query field") || msg.contains("cannot query field") {
+                let msg_lc = msg.to_lowercase();
+                // Goldsky / schema variants: "Cannot query field …" or "Type `OrderFilledEvent` has no field `size`"
+                let extended_fields_rejected = msg_lc.contains("cannot query field")
+                    || msg_lc.contains("has no field")
+                    || msg_lc.contains("unknown field");
+                if extended_fields_rejected {
                     tracing::warn!(
                         "subgraph orderFilledEvents extended fields not supported; using minimal query ({role})"
                     );

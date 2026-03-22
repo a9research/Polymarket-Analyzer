@@ -1,5 +1,8 @@
 //! Per-trade **realized** PnL from the Data API trade stream using average-cost inventory
-//! per `(condition_id, outcome)` key. Buys contribute `pnl = 0`; sells realize `(price - avg_cost) * size_sold`.
+//! per outcome position. Buys contribute `pnl = 0`; sells realize `(price - avg_cost) * size_sold`.
+//!
+//! **Inventory key:** prefer `asset` (outcome token id) when present so BUY rows that carry
+//! `outcome: "Yes"` and SELL rows that only have `outcome_index` still share one book.
 
 use crate::polymarket::data_api::{Trade, TradeSide};
 use std::collections::HashMap;
@@ -14,10 +17,18 @@ fn trade_ts_sec(t: &Trade) -> i64 {
 }
 
 fn position_key(t: &Trade) -> String {
+    if let Some(ref a) = t.asset {
+        let a = a.trim();
+        if !a.is_empty() {
+            return format!("asset:{}", a.to_lowercase());
+        }
+    }
     let leg = if let Some(ref o) = t.outcome {
         let s = o.trim();
         if s.is_empty() {
-            t.outcome_index.map(|i| format!("i:{i}")).unwrap_or_else(|| "unknown".into())
+            t.outcome_index
+                .map(|i| format!("i:{i}"))
+                .unwrap_or_else(|| "unknown".into())
         } else {
             format!("o:{}", s.to_lowercase())
         }
@@ -134,6 +145,31 @@ mod tests {
         let p = per_trade_realized_pnl(&trades);
         assert!((p[0] - 0.0).abs() < 1e-9);
         assert!((p[1] - 2.0).abs() < 1e-9);
+    }
+
+    /// BUY 带 `outcome`、SELL 仅带 `outcome_index` 时，旧逻辑会拆成两个 book；用同一 `asset` 应对齐。
+    #[test]
+    fn outcome_vs_outcome_index_same_asset_reconciles() {
+        let mut b = t_buy(10.0, 0.4, 100);
+        b.asset = Some("0xabc_token_yes".into());
+        b.outcome = Some("Yes".into());
+        b.outcome_index = None;
+
+        let mut s = t_sell(10.0, 0.6, 200);
+        s.asset = Some("0xabc_token_yes".into());
+        s.outcome = None;
+        s.outcome_index = Some(0);
+
+        let trades = vec![b, s];
+        let p = per_trade_realized_pnl(&trades);
+        assert!(p[0].abs() < 1e-9);
+        let expected = 10.0 * (0.6 - 0.4);
+        assert!(
+            (p[1] - expected).abs() < 1e-6,
+            "got {} want {}",
+            p[1],
+            expected
+        );
     }
 
     #[test]

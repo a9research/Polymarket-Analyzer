@@ -1008,6 +1008,52 @@ impl Storage {
         Ok(out)
     }
 
+    /// Rank wallets by **sum of per-trade realized PnL** in `wallet_trade_pnl` since `cutoff_ms`
+    /// (trade `timestamp` normalized to milliseconds), scoped to rows whose `cache_key` matches
+    /// the current row in `wallet_leaderboard_stats` (avoids stale rows from superseded cache keys).
+    ///
+    /// Windows: use UTC calendar start-of-day for “today”, or rolling N days for week/month in the API layer.
+    pub async fn fetch_leaderboard_since_trade_ts(
+        &self,
+        limit: i64,
+        cutoff_ms: i64,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT w.wallet AS wallet,
+                   COALESCE(SUM(w.pnl), 0)::double precision AS net_pnl,
+                   COALESCE(SUM(ABS(w.cash_flow)), 0)::double precision AS total_volume,
+                   COUNT(*)::bigint AS trades_count,
+                   MAX(s.updated_at) AS updated_at
+            FROM wallet_trade_pnl w
+            INNER JOIN wallet_leaderboard_stats s
+              ON LOWER(s.wallet) = LOWER(w.wallet) AND s.cache_key = w.cache_key
+            WHERE (CASE WHEN w.timestamp > 1000000000000 THEN w.timestamp ELSE w.timestamp * 1000 END) >= $1
+            GROUP BY w.wallet
+            ORDER BY net_pnl DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(cutoff_ms)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("fetch leaderboard (time window)")?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let updated: DateTime<Utc> = r.try_get::<DateTime<Utc>, _>("updated_at")?;
+            out.push(serde_json::json!({
+                "wallet": r.try_get::<String, _>("wallet")?,
+                "net_pnl": r.try_get::<f64, _>("net_pnl")?,
+                "total_volume": r.try_get::<f64, _>("total_volume")?,
+                "trades_count": r.try_get::<i64, _>("trades_count")?,
+                "updated_at": updated.to_rfc3339(),
+            }));
+        }
+        Ok(out)
+    }
+
     /// Export ambiguous reconciliation rows for a given `ingestion_run.id` (§1.5 / P2).
     pub async fn fetch_ambiguous_queue_by_run(
         &self,

@@ -176,6 +176,17 @@ pub struct GammaProfileSummary {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    /// ISO 8601 from Gamma `createdAt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_badge: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_wallet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_username: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +250,7 @@ pub struct DataFetchMeta {
 pub struct LifetimeMetrics {
     pub total_trades: usize,
     pub total_volume: f64,
-    /// Trade-level cash-flow sum (buys negative, sells positive); not full portfolio accounting.
+    /// Sum of per-trade **realized** PnL (average-cost inventory per outcome token / `asset` key).
     pub net_pnl: f64,
     /// Sum of `currentValue` from Data API open positions when available.
     pub open_position_value: f64,

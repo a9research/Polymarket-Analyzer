@@ -33,7 +33,8 @@ enabled = false
 # cap_rows_per_stream = 0       # 每条子图流最多保留行数；0=不限制；冒烟可设 1000
 # show_progress = true
 # user_agent = "polymarket-account-analyzer/0.2 (subgraph)"
-# Request extra orderFilledEvent fields (tx hash, condition, size, price); auto-falls back if subgraph rejects.
+# Request extra orderFilledEvent fields (tx hash, condition, size, price). Auto-falls back to minimal fields if the
+# subgraph rejects them (e.g. "Cannot query field …" or Goldsky-style "Type `OrderFilledEvent` has no field …").
 # extended_fill_fields = true
 
 # --- Analytics: which trade stream feeds lifetime/distribution/patterns (§1.5) ---
