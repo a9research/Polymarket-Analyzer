@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// 新算报告根字段 `schema_version`；与 README / 前端说明对齐，变更时同步 bump。
-pub const REPORT_SCHEMA_VERSION: &str = "2.5.2";
+pub const REPORT_SCHEMA_VERSION: &str = "2.5.4";
 
 fn default_schema_version() -> String {
     // Legacy cached reports without this field deserialize as 1.0.0; new runs set 2.0.0 in `build_report`.
@@ -184,6 +184,20 @@ pub struct TradeLedgerRow {
     pub title: Option<String>,
 }
 
+/// `trade_ledger` 与 `trade_ledger_paired` 对账：无记录被删，仅视图过滤 BUY；Σpnl 应一致（BUY 行 pnl 恒为 0）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TradeLedgerIntegrity {
+    pub full_row_count: usize,
+    pub buy_row_count: usize,
+    pub sell_row_count: usize,
+    pub settlement_row_count: usize,
+    pub paired_row_count: usize,
+    pub sum_pnl_full: f64,
+    pub sum_pnl_paired: f64,
+    /// `paired_row_count == sell + settlement` 且 Σpnl 差在容差内。
+    pub integrity_ok: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FrontendPresentation {
     pub biggest_wins: Vec<TradeHighlight>,
@@ -193,6 +207,12 @@ pub struct FrontendPresentation {
     /// 时间序：成交 + 结算行；可与 `lifetime.net_pnl` 逐项对照。
     #[serde(default)]
     pub trade_ledger: Vec<TradeLedgerRow>,
+    /// 仅 **SELL** + **SETTLEMENT**（退出侧）：每行均有 `pnl`；买入开仓不单独占行，与 `trade_pnl` 平均成本法一致。
+    #[serde(default)]
+    pub trade_ledger_paired: Vec<TradeLedgerRow>,
+    /// 完整台账 vs 已平仓视图行数与 Σpnl 对账（2.5.4+）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_ledger_integrity: Option<TradeLedgerIntegrity>,
     /// One-shot text for pasting into an LLM as wallet context.
     pub ai_copy_prompt: String,
 }

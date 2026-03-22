@@ -399,7 +399,7 @@ api.forevex.trade {
    `curl -v --max-time 5 http://127.0.0.1:3000/health`  
    应返回 **`ok`**。若本机都失败，说明服务没起来或端口不是 3000。
 3b. **确认二进制报告 schema**（与「同步了代码但 `analyze` 仍返回旧 `schema_version`」排查）：  
-   `curl -sS http://127.0.0.1:3000/version` → JSON 里的 **`report_schema_version`** 应为当前发布（如 **`2.5.2`**）。若此处仍是 **`2.5.1`**，说明**跑的还是旧镜像/旧二进制**（需 **`docker compose build --no-cache`** 或重新发布产物），而非仅「刷新了页面」。
+   `curl -sS http://127.0.0.1:3000/version` → JSON 里的 **`report_schema_version`** 应为当前发布（如 **`2.5.4`**）。若明显落后，说明**跑的还是旧镜像/旧二进制**（需 **`docker compose build --no-cache`** 或重新发布产物），而非仅「刷新了页面」。
 4. **`/analyze` 可能很慢**：会从 Polymarket Data API 等拉数据，**几分钟都正常**；`curl` **要等整份 JSON 响应结束**才会把 body 给你，期间终端可能**长时间没有输出**。请加大超时，例如：  
    `curl -v --max-time 600 "http://127.0.0.1:3000/analyze/0x你的地址" | head -c 500`
 5. **从你电脑访问 `http://54.x.x.x:3000` 一直卡住**：检查云厂商 **安全组入站**、Linux **`sudo ufw status`**，是否放行 **TCP 3000**；可用 `curl -v --max-time 10 http://54.x.x.x:3000/health` 先测（部署了新版本才有 `/health`，旧镜像需 `docker compose up --build -d` 重建）。
@@ -665,7 +665,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-当前发布 **`schema_version: "2.5.2"`**（旧缓存可能仍为 `2.5.1` 及更早）。**2.5.2**：**`frontend.trade_ledger`** — 时间序逐笔台账（Data API 每笔成交 BUY/SELL + 已 resolve 持仓的 **SETTLEMENT** 行；字段含买入/卖出侧价额与本行 **`pnl`**）。**2.5.1**：结算 PnL 补齐 **`asset:{token}`** 库存键。**2.5**：**`net_pnl_settlement`**、**`net_pnl`**。**2.4** / **2.3**：略。
+当前发布 **`schema_version: "2.5.4"`**（旧缓存可能仍为 `2.5.3` 及更早）。**2.5.4**：**`frontend.trade_ledger_integrity`** — 全表 vs 已平仓 **行数** + **Σpnl** 对账，证明 **`trade_ledger_paired` 仅为去掉 BUY 的视图**，**`trade_ledger` 仍含全部成交**。**2.5.3**：**`trade_ledger_paired`**。**2.5.2**：**`trade_ledger`**。**2.5.1**：**`asset:{token}`**。**2.5**：**`net_pnl_settlement`**、**`net_pnl`**。**2.4** / **2.3**：略。
 
 | 块 | 说明 |
 |----|------|
@@ -674,7 +674,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 | **`trading_patterns`** | **`grid_like_market_ratio`**、**`win_rate_closed_positions`**（样本 ≥5 时）、**`closed_positions_sample_size`** |
 | **`strategy_inference`** | `src/strategy.rs`：**`high-frequency-grid-scalper`**（网格占比 >20% 且 entry P90 < 60s 等）；**`rule_json`** 含 `entry_window_sec_avg`、`preferred_price_ranges`、`jackpot_bias`、`multi_window_count` 等；更长的 **pseudocode** |
 | **`price_buckets_chart`** | 固定区间 + `label`（`<0.1`、`0.1–0.3`…），便于前端图表轴一致 |
-| **`frontend`** | **`biggest_wins` / `biggest_losses`**（按 **`pnl`** 排序：单笔**已实现**盈亏，平均成本法；买为 0）、**`recent_trades`**、**`trade_ledger`**（2.5.2+，逐笔台账）、**`current_positions`**、**`ai_copy_prompt`** |
+| **`frontend`** | **`biggest_wins` / `biggest_losses`**、**`recent_trades`**、**`trade_ledger`**（2.5.2+ 完整流水）、**`trade_ledger_paired`**（2.5.3+ 仅卖+结算）、**`trade_ledger_integrity`**（2.5.4+ 对账）、**`current_positions`**、**`ai_copy_prompt`** |
 | **`gamma_profile`** | Gamma **`/public-profile`**：`display_name`、`username`、`avatar_url`、`created_at`、`bio`、`verified_badge`、`proxy_wallet`、`x_username`（有则填） |
 
 仍包含：`wallet`、**`trades_count`**（2.4+ 为市场数）、**`trades_fill_count`**（2.4+）、**`report_updated_at`**（RFC3339 UTC：新算为生成时刻；读缓存时取 PG `updated_at`）、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。

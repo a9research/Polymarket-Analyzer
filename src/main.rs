@@ -25,7 +25,8 @@ use polymarket_account_analyzer::{
         FrontendPresentation, GammaProfileSummary, IngestionMeta, IngestionTruncation,
         LifetimeMetrics, MarketDistributionItem, NormalizedPriceBucket, PositionRowDisplay,
         ReportProvenance, REPORT_SCHEMA_VERSION, SideBias, StrategyInference, TimeAnalysis,
-        TradeHighlight, TradeLedgerRow, TradingPatterns, WinRateByMarketType,
+        TradeHighlight, TradeLedgerIntegrity, TradeLedgerRow, TradingPatterns,
+        WinRateByMarketType,
     },
     settlement_pnl::{settlement_legs_for_open_book, GammaResolutionPayouts, SettlementLeg},
     storage::{Storage, WalletPipelineSnapshotMeta},
@@ -68,6 +69,46 @@ fn trade_ts_ms(t: &Trade) -> i64 {
 }
 
 /// 时间序台账：每条 `/trades` 一行 + 已 resolve 的 **SETTLEMENT** 行（与 `net_pnl` 口径一致）。
+/// 从完整台账去掉 `BUY` 行：只保留产生已实现盈亏的 **卖出** 与 **结算**（「成对」的退出侧视角，成本为持仓均价）。
+fn trade_ledger_paired_from_full(full: &[TradeLedgerRow]) -> Vec<TradeLedgerRow> {
+    full.iter()
+        .filter(|r| r.row_kind != "BUY")
+        .cloned()
+        .collect()
+}
+
+/// 证明：`trade_ledger_paired` 仅为 `trade_ledger` 去掉 BUY 的**视图**，不删数据；Σpnl 因 BUY 行 pnl=0 应与全表一致。
+fn compute_trade_ledger_integrity(
+    full: &[TradeLedgerRow],
+    paired: &[TradeLedgerRow],
+) -> TradeLedgerIntegrity {
+    let full_row_count = full.len();
+    let buy_row_count = full.iter().filter(|r| r.row_kind == "BUY").count();
+    let sell_row_count = full.iter().filter(|r| r.row_kind == "SELL").count();
+    let settlement_row_count = full
+        .iter()
+        .filter(|r| r.row_kind == "SETTLEMENT")
+        .count();
+    let paired_row_count = paired.len();
+    let rows_ok = paired_row_count == sell_row_count + settlement_row_count
+        && full_row_count == buy_row_count + sell_row_count + settlement_row_count;
+    let sum_pnl_full: f64 = full.iter().map(|r| r.pnl).sum();
+    let sum_pnl_paired: f64 = paired.iter().map(|r| r.pnl).sum();
+    let diff = (sum_pnl_full - sum_pnl_paired).abs();
+    let tol = 1e-6_f64.max(1e-9 * sum_pnl_full.abs().max(sum_pnl_paired.abs()));
+    let pnl_ok = diff <= tol;
+    TradeLedgerIntegrity {
+        full_row_count,
+        buy_row_count,
+        sell_row_count,
+        settlement_row_count,
+        paired_row_count,
+        sum_pnl_full,
+        sum_pnl_paired,
+        integrity_ok: rows_ok && pnl_ok,
+    }
+}
+
 fn build_trade_ledger(
     trades: &[Trade],
     per_trade_pnl: &[f64],
@@ -197,6 +238,8 @@ fn build_frontend_presentation(
     win_rate: f64,
     total_vol: f64,
     trade_ledger: Vec<TradeLedgerRow>,
+    trade_ledger_paired: Vec<TradeLedgerRow>,
+    trade_ledger_integrity: Option<TradeLedgerIntegrity>,
 ) -> FrontendPresentation {
     let mut scored: Vec<TradeHighlight> = trades
         .iter()
@@ -273,6 +316,8 @@ fn build_frontend_presentation(
         recent_trades: recent,
         current_positions,
         trade_ledger,
+        trade_ledger_paired,
+        trade_ledger_integrity,
         ai_copy_prompt,
     }
 }
@@ -1836,6 +1881,14 @@ fn build_report(
         &settlement_legs_vec,
         &augment.resolution_ts_by_slug,
     );
+    let trade_ledger_paired = trade_ledger_paired_from_full(&trade_ledger);
+    let trade_ledger_integrity = {
+        let i = compute_trade_ledger_integrity(&trade_ledger, &trade_ledger_paired);
+        if !i.integrity_ok {
+            tracing::warn!(?i, "trade_ledger_integrity check failed");
+        }
+        Some(i)
+    };
     let frontend = Some(build_frontend_presentation(
         wallet,
         trades,
@@ -1845,6 +1898,8 @@ fn build_report(
         win_rate_overall,
         total_volume,
         trade_ledger,
+        trade_ledger_paired,
+        trade_ledger_integrity,
     ));
 
     let open_position_value: f64 = augment
@@ -1929,6 +1984,12 @@ fn build_report(
             }
             notes.push(
                 "frontend.trade_ledger: chronological rows (BUY/SELL per Data API fill; SETTLEMENT = resolve payout on remaining shares). Sum of `pnl` ≈ lifetime.net_pnl when fills + settlements complete the book.".into(),
+            );
+            notes.push(
+                "frontend.trade_ledger_paired (2.5.3+): only SELL + SETTLEMENT rows from the same ledger; each row has realized `pnl`. BUY opens are folded into avg cost (same model as per_trade_realized_pnl). Not strict FIFO lot pairing.".into(),
+            );
+            notes.push(
+                "frontend.trade_ledger_integrity (2.5.4+): row counts + sum(pnl) prove paired view is a BUY-filter of full ledger; no fills removed from trade_ledger.".into(),
             );
             notes
         },
