@@ -27,6 +27,7 @@ use polymarket_account_analyzer::{
         ReportProvenance, SideBias, StrategyInference, TimeAnalysis, TradeHighlight,
         TradingPatterns, WinRateByMarketType,
     },
+    settlement_pnl::{settlement_breakdown_for_open_book, GammaResolutionPayouts},
     storage::{Storage, WalletPipelineSnapshotMeta},
     strategy::{self, StrategyInputs},
     trade_pnl,
@@ -41,6 +42,8 @@ use uuid::Uuid;
 #[derive(Default)]
 struct ReportAugment {
     resolution_ts_by_slug: HashMap<String, i64>,
+    /// Gamma-resolved payout vectors keyed by market `slug` (same cap as resolution times).
+    gamma_resolution_by_slug: HashMap<String, GammaResolutionPayouts>,
     open_positions: Vec<UserPosition>,
     closed_positions: Vec<ClosedPosition>,
     gamma_profile: Option<GammaProfileSummary>,
@@ -63,18 +66,22 @@ fn percentile_i64_sorted(sorted: &[i64], p: f64) -> Option<f64> {
     Some(sorted[idx.min(sorted.len() - 1)] as f64)
 }
 
-async fn fetch_resolution_times_for_trades(
+async fn fetch_gamma_context_for_trades(
     gamma: &GammaApiClient,
     trades: &[Trade],
     max_slugs: usize,
-) -> HashMap<String, i64> {
+) -> (
+    HashMap<String, i64>,
+    HashMap<String, GammaResolutionPayouts>,
+) {
     if max_slugs == 0 {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     }
     let slugs_set: HashSet<String> = trades.iter().map(|t| t.slug.clone()).collect();
     let mut slugs: Vec<String> = slugs_set.into_iter().collect();
     slugs.sort();
-    let mut out = HashMap::new();
+    let mut resolution_ts_by_slug = HashMap::new();
+    let mut gamma_resolution_by_slug = HashMap::new();
     for slug in slugs.into_iter().take(max_slugs) {
         match gamma.market_by_slug(&slug).await {
             Ok(m) => {
@@ -84,13 +91,16 @@ async fn fetch_resolution_times_for_trades(
                     .and_then(parse_gamma_datetime_utc)
                     .or_else(|| m.end_date.as_deref().and_then(parse_gamma_datetime_utc));
                 if let Some(dt) = ts {
-                    out.insert(slug, dt.timestamp());
+                    resolution_ts_by_slug.insert(slug.clone(), dt.timestamp());
+                }
+                if let Some(gp) = GammaResolutionPayouts::from_market(&m) {
+                    gamma_resolution_by_slug.insert(slug, gp);
                 }
             }
-            Err(e) => tracing::debug!("gamma resolution time skip slug={slug} err={e:#}"),
+            Err(e) => tracing::debug!("gamma context skip slug={slug} err={e:#}"),
         }
     }
-    out
+    (resolution_ts_by_slug, gamma_resolution_by_slug)
 }
 
 fn build_frontend_presentation(
@@ -844,7 +854,7 @@ async fn analyze_wallet(
 
     let gamma_timing = GammaApiClient::new(http.clone(), rate);
     let gamma_timing_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
-    let resolution_ts_by_slug = fetch_resolution_times_for_trades(
+    let (resolution_ts_by_slug, gamma_resolution_by_slug) = fetch_gamma_context_for_trades(
         &gamma_timing,
         &trades_result.trades,
         gamma_timing_cap,
@@ -907,6 +917,7 @@ async fn analyze_wallet(
 
     let augment = ReportAugment {
         resolution_ts_by_slug,
+        gamma_resolution_by_slug,
         open_positions,
         closed_positions,
         gamma_profile,
@@ -1441,7 +1452,26 @@ fn build_report(
         .collect::<HashSet<_>>()
         .len();
     let fill_denom = trade_fills_count.max(1);
-    let lifetime_net_pnl: f64 = per_trade_pnl.iter().sum();
+    let net_pnl_realized_trades: f64 = per_trade_pnl.iter().sum();
+
+    let book = trade_pnl::outcome_book_after_trades(trades);
+    let mut condition_to_slug: HashMap<String, String> = HashMap::new();
+    for t in trades {
+        if t.slug.trim().is_empty() {
+            continue;
+        }
+        condition_to_slug
+            .entry(normalize_condition_id(&t.condition_id))
+            .or_insert_with(|| t.slug.clone());
+    }
+    let settlement = settlement_breakdown_for_open_book(
+        &book,
+        &augment.gamma_resolution_by_slug,
+        &condition_to_slug,
+    );
+    let net_pnl_settlement = settlement.total;
+    let lifetime_net_pnl = net_pnl_realized_trades + net_pnl_settlement;
+
     let mut total_volume = 0.0_f64;
     let max_single_win;
     let max_single_loss;
@@ -1527,13 +1557,15 @@ fn build_report(
         .cloned()
         .filter(|x| *x > 0.0)
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or(0.0);
+        .unwrap_or(0.0)
+        .max(settlement.max_leg_win);
     max_single_loss = per_trade_pnl
         .iter()
         .cloned()
         .filter(|x| *x < 0.0)
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or(0.0);
+        .unwrap_or(0.0)
+        .min(settlement.min_leg_loss);
 
     let total_volume_nonzero = if total_volume == 0.0 { 1.0 } else { total_volume };
     let mut market_distribution: Vec<MarketDistributionItem> = dist
@@ -1714,7 +1746,7 @@ fn build_report(
     let open_positions_count = augment.open_positions.len();
 
     AnalyzeReport {
-        schema_version: "2.4.0".to_string(),
+        schema_version: "2.5.0".to_string(),
         wallet: wallet.to_string(),
         trades_count: distinct_slugs_count,
         trades_fill_count: trade_fills_count,
@@ -1727,6 +1759,7 @@ fn build_report(
             total_trades: distinct_slugs_count,
             total_volume,
             net_pnl: lifetime_net_pnl,
+            net_pnl_settlement,
             open_position_value,
             max_single_win,
             max_single_loss,
@@ -1759,7 +1792,7 @@ fn build_report(
         gamma_profile: augment.gamma_profile.clone(),
         notes: {
             let mut notes = vec![
-                "lifetime.net_pnl: sum of per-trade realized PnL (avg-cost inventory; asset/outcome keying); closed_realized_pnl_sum from /closed-positions for cross-check; open_position_value from /positions; entry P50/P90 use Gamma resolution times (capped slugs).".into(),
+                "lifetime.net_pnl = per-trade SELL-realized (avg-cost) + lifetime.net_pnl_settlement (Gamma outcomePrices on remaining inventory at resolved markets; BUY-only legs included). Capped by max_gamma_slugs_for_timing. closed_realized_pnl_sum / open_position_value cross-checks unchanged; entry P50/P90 use Gamma times.".into(),
                 format!(
                     "trades_count (2.4+)=distinct markets (unique slug, else condition_id), aligned with Polymarket user-stats.trades; trades_fill_count={} is Data API /trades row count.",
                     trade_fills_count
@@ -1771,6 +1804,12 @@ fn build_report(
                     max_offset_allowed
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+            if settlement.legs_used > 0 {
+                notes.push(format!(
+                    "net_pnl_settlement: {} ({} resolved open leg(s) matched via Gamma outcomePrices).",
+                    net_pnl_settlement, settlement.legs_used
                 ));
             }
             notes
@@ -1844,11 +1883,8 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
                 .await
             {
                 Ok(Some(report)) => (StatusCode::OK, Json(report)).into_response(),
-                Ok(None) => (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "cache_miss" })),
-                )
-                    .into_response(),
+                // 204：缓存未命中，避免浏览器把「正常 miss」记成 404 失败请求
+                Ok(None) => StatusCode::NO_CONTENT.into_response(),
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "error": format!("{:#}", e) })),

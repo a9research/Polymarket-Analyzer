@@ -80,6 +80,17 @@ pub struct Market {
     pub closed_time: Option<String>,
     pub closed: Option<bool>,
     pub resolved_by: Option<String>,
+    /// JSON array serialized as string, e.g. `["Yes","No"]`.
+    #[serde(default)]
+    pub outcomes: Option<String>,
+    /// JSON array serialized as string; when resolved often `["1","0"]` (USDC per share).
+    #[serde(default)]
+    pub outcome_prices: Option<String>,
+    /// JSON array of CLOB token ids aligned with `outcomes`.
+    #[serde(default)]
+    pub clob_token_ids: Option<String>,
+    #[serde(default)]
+    pub uma_resolution_status: Option<String>,
     #[serde(default)]
     pub creator_username: Option<String>,
     #[serde(default)]

@@ -258,8 +258,11 @@ pub struct DataFetchMeta {
 pub struct LifetimeMetrics {
     pub total_trades: usize,
     pub total_volume: f64,
-    /// Sum of per-trade **realized** PnL (average-cost inventory per outcome token / `asset` key).
+    /// Per-trade SELL-realized + Gamma settlement on remaining shares at resolved markets.
     pub net_pnl: f64,
+    /// Σ `shares × (Gamma outcomePrice − avg_cost)` for inventory still open at resolution (see notes).
+    #[serde(default)]
+    pub net_pnl_settlement: f64,
     /// Sum of `currentValue` from Data API open positions when available.
     pub open_position_value: f64,
     pub max_single_win: f64,

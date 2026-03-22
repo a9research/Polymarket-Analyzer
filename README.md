@@ -576,7 +576,7 @@ cargo run --release -- report-from-canonical-run "550e8400-..." --out replay.jso
 | 参数 | 说明 |
 |------|------|
 | `no_cache` | 跳过报告缓存 |
-| `cached_only` | **仅**读 Postgres 报告缓存；命中返回 200 JSON，未命中 **404** `{"error":"cache_miss"}`；与 `no_cache` 互斥。供前端「先交付缓存、后台全量重算」 |
+| `cached_only` | **仅**读 Postgres 报告缓存；命中返回 200 JSON，未命中 **204 No Content**（无 body，避免浏览器把正常 miss 记成 404）；未配置存储时仍为 **404** `{"error":"cache_miss"}`；与 `no_cache` 互斥。布尔查询请写 **`cached_only=true`**（不要用 `=1`，Axum 会 400） |
 | `with_subgraph` / `no_subgraph` | 子图开关 |
 | `subgraph_cap_rows` | 子图每流行数上限（整数，同 CLI） |
 | `with_reconciliation` / `no_reconciliation` | 对账开关 |
@@ -663,11 +663,11 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-当前发布 **`schema_version: "2.4.0"`**（旧缓存可能仍为 `2.3.0` 及更早）。**2.4**：**`trades_count`**（及 **`lifetime.total_trades`**）= **不同市场数**：非空 `slug` 去重（小写），`slug` 为空则按 **`condition_id`** 去重——与 Polymarket **`user-stats.trades`** 典型口径一致；**`trades_fill_count`** = Data API **`/trades` 行数**（明细成交笔数）。**2.3**：`lifetime.net_pnl` = Σ 单笔已实现（平均成本库存；库存键优先 **`asset`**）。
+当前发布 **`schema_version: "2.5.0"`**（旧缓存可能仍为 `2.4.0` 及更早）。**2.5**：**`lifetime.net_pnl_settlement`** = 对 **Gamma 已结算**（`closed` + `umaResolutionStatus=resolved` 等）市场，按 **`outcomePrices`** 对**仍持仓**的份额计 `Σ shares×(payout−avg_cost)`（与 `trade_pnl` 同一平均成本账本；无需 SELL）；**`lifetime.net_pnl`** = 单笔 **SELL 已实现** + **`net_pnl_settlement`**；受 **`max_gamma_slugs_for_timing`** 与 slug 拉取上限约束。**2.4**：**`trades_count`** / **`total_trades`** = 不同市场数；**`trades_fill_count`** = `/trades` 行数。**2.3**：已实现口径仍以平均成本、`asset` 键为主。
 
 | 块 | 说明 |
 |----|------|
-| **`lifetime`** | **`net_pnl`**（2.3+）= Σ 单笔已实现；`total_volume` = Σ `size*price`；**`total_trades`**（2.4+）= 不同 slug/条件数（同根 `trades_count`）；**`max_single_win` / `max_single_loss`**；`open_position_value`、**`closed_realized_pnl_sum`**、**`open_positions_count`** |
+| **`lifetime`** | **`net_pnl`**（2.5+）= SELL 已实现 + **`net_pnl_settlement`**（Gamma 结算份额）；`total_volume` = Σ `size*price`；**`total_trades`**（2.4+）= 不同 slug/条件数；**`max_single_win` / `max_single_loss`**（含结算腿极值）；`open_position_value`、**`closed_realized_pnl_sum`**、**`open_positions_count`** |
 | **`time_analysis`** | **`entry_to_resolution_seconds`**（有 Gamma 解析时填充）、**`entry_to_resolution_p50_sec` / `p90_sec`**、`metadata_missing_ratio` 按样本比例更新 |
 | **`trading_patterns`** | **`grid_like_market_ratio`**、**`win_rate_closed_positions`**（样本 ≥5 时）、**`closed_positions_sample_size`** |
 | **`strategy_inference`** | `src/strategy.rs`：**`high-frequency-grid-scalper`**（网格占比 >20% 且 entry P90 < 60s 等）；**`rule_json`** 含 `entry_window_sec_avg`、`preferred_price_ranges`、`jackpot_bias`、`multi_window_count` 等；更长的 **pseudocode** |

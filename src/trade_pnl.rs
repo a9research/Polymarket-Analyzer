@@ -45,6 +45,66 @@ struct BookPos {
     avg_price: f64,
 }
 
+/// Remaining inventory after processing all fills (same keying / ordering as [`per_trade_realized_pnl`]).
+/// Values are `(shares, avg_price)` per outcome lot; used for resolution settlement PnL.
+pub fn outcome_book_after_trades(trades: &[Trade]) -> HashMap<String, (f64, f64)> {
+    let mut order: Vec<usize> = (0..trades.len()).collect();
+    order.sort_by(|&a, &b| {
+        let ta = trade_ts_sec(&trades[a]);
+        let tb = trade_ts_sec(&trades[b]);
+        ta.cmp(&tb).then_with(|| {
+            trades[a]
+                .transaction_hash
+                .cmp(&trades[b].transaction_hash)
+        }).then_with(|| trades[a].slug.cmp(&trades[b].slug))
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut book: HashMap<String, BookPos> = HashMap::new();
+
+    for &i in &order {
+        let t = &trades[i];
+        let key = position_key(t);
+        let size = t.size;
+        let price = t.price;
+        if size <= 0.0 || !price.is_finite() || !size.is_finite() {
+            continue;
+        }
+
+        match t.side {
+            TradeSide::Buy => {
+                let p = book.entry(key).or_insert(BookPos {
+                    shares: 0.0,
+                    avg_price: 0.0,
+                });
+                let new_shares = p.shares + size;
+                if new_shares > 1e-12 {
+                    p.avg_price = (p.shares * p.avg_price + size * price) / new_shares;
+                } else {
+                    p.avg_price = price;
+                }
+                p.shares = new_shares;
+            }
+            TradeSide::Sell => {
+                let p = book.entry(key).or_insert(BookPos {
+                    shares: 0.0,
+                    avg_price: 0.0,
+                });
+                if p.shares <= 1e-12 {
+                    continue;
+                }
+                let sell_qty = size.min(p.shares);
+                p.shares -= sell_qty;
+            }
+        }
+    }
+
+    book
+        .into_iter()
+        .map(|(k, p)| (k, (p.shares, p.avg_price)))
+        .collect()
+}
+
 /// Returns one realized PnL value per input trade, in **the same order** as `trades`.
 ///
 /// Model: long-only inventory per market outcome; sells close against average cost.
