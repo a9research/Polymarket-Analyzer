@@ -24,6 +24,16 @@ pub struct SettlementBreakdown {
     pub min_leg_loss: f64,
 }
 
+/// One resolved-market settlement leg (for ledgers / UI).
+#[derive(Clone, Debug)]
+pub struct SettlementLeg {
+    pub slug: String,
+    pub shares: f64,
+    pub avg_entry_price: f64,
+    pub payout_per_share: f64,
+    pub pnl: f64,
+}
+
 fn parse_json_string_list(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
@@ -123,17 +133,13 @@ fn outcome_index_from_leg(
 /// **`asset_to_slug`:** `trade_pnl::position_key` uses **only** `asset:{token}` (no `condition_id::`)
 /// when `Trade.asset` is set; those keys never contain `::`, so we resolve slug from this map
 /// (built from the trade stream: last-seen slug per asset id).
-pub fn settlement_breakdown_for_open_book(
+pub fn settlement_legs_for_open_book(
     book: &HashMap<String, (f64, f64)>,
     payouts_by_slug: &HashMap<String, GammaResolutionPayouts>,
     condition_to_slug: &HashMap<String, String>,
     asset_to_slug: &HashMap<String, String>,
-) -> SettlementBreakdown {
-    let mut total = 0.0_f64;
-    let mut legs_used = 0_usize;
-    let mut max_leg_win = 0.0_f64;
-    let mut min_leg_loss = 0.0_f64;
-
+) -> Vec<SettlementLeg> {
+    let mut out = Vec::new();
     for (key, (shares, avg_price)) in book {
         if *shares <= 1e-12 || !shares.is_finite() || !avg_price.is_finite() {
             continue;
@@ -180,19 +186,44 @@ pub fn settlement_breakdown_for_open_book(
         if !leg_pnl.is_finite() {
             continue;
         }
-        total += leg_pnl;
-        legs_used += 1;
-        if leg_pnl > max_leg_win {
-            max_leg_win = leg_pnl;
+        out.push(SettlementLeg {
+            slug: slug.to_string(),
+            shares: *shares,
+            avg_entry_price: *avg_price,
+            payout_per_share: payout,
+            pnl: leg_pnl,
+        });
+    }
+    out
+}
+
+pub fn settlement_breakdown_for_open_book(
+    book: &HashMap<String, (f64, f64)>,
+    payouts_by_slug: &HashMap<String, GammaResolutionPayouts>,
+    condition_to_slug: &HashMap<String, String>,
+    asset_to_slug: &HashMap<String, String>,
+) -> SettlementBreakdown {
+    let legs = settlement_legs_for_open_book(
+        book,
+        payouts_by_slug,
+        condition_to_slug,
+        asset_to_slug,
+    );
+    let mut total = 0.0_f64;
+    let mut max_leg_win = 0.0_f64;
+    let mut min_leg_loss = 0.0_f64;
+    for leg in &legs {
+        total += leg.pnl;
+        if leg.pnl > max_leg_win {
+            max_leg_win = leg.pnl;
         }
-        if leg_pnl < min_leg_loss {
-            min_leg_loss = leg_pnl;
+        if leg.pnl < min_leg_loss {
+            min_leg_loss = leg.pnl;
         }
     }
-
     SettlementBreakdown {
         total,
-        legs_used,
+        legs_used: legs.len(),
         max_leg_win,
         min_leg_loss,
     }

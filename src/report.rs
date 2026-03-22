@@ -158,12 +158,38 @@ pub struct PositionRowDisplay {
     pub current_value: Option<f64>,
 }
 
+/// 逐笔台账：Data API 每条成交一行 + 已结算持仓的 **SETTLEMENT** 合成行（买入/卖出或清算价与名义、盈亏）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeLedgerRow {
+    /// Unix 毫秒（结算行用 Gamma 解析时间，缺省则为最后一笔成交时间）。
+    pub ts_ms: i64,
+    pub slug: String,
+    pub condition_id: String,
+    pub outcome: Option<String>,
+    /// `BUY` | `SELL` | `SETTLEMENT`
+    pub row_kind: String,
+    pub size: f64,
+    /// 买入均价：BUY 行为成交价；SELL 行为平均成本；SETTLEMENT 为持仓成本。
+    pub buy_price: f64,
+    pub buy_total: f64,
+    /// 卖出/清算价：SELL 为成交价；SETTLEMENT 为 Gamma payout；BUY 为 0。
+    pub sell_price: f64,
+    pub sell_total: f64,
+    /// 本行已实现盈亏：SELL 为平均成本法；SETTLEMENT 为 `size*(payout−avg)`；BUY 为 0。
+    pub pnl: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FrontendPresentation {
     pub biggest_wins: Vec<TradeHighlight>,
     pub biggest_losses: Vec<TradeHighlight>,
     pub recent_trades: Vec<TradeHighlight>,
     pub current_positions: Vec<PositionRowDisplay>,
+    /// 时间序：成交 + 结算行；可与 `lifetime.net_pnl` 逐项对照。
+    #[serde(default)]
+    pub trade_ledger: Vec<TradeLedgerRow>,
     /// One-shot text for pasting into an LLM as wallet context.
     pub ai_copy_prompt: String,
 }

@@ -663,7 +663,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-当前发布 **`schema_version: "2.5.1"`**（旧缓存可能仍为 `2.5.0` 及更早）。**2.5.1**：结算 PnL 补齐 **`asset:{token}`** 库存键（Data API 常见、无 `condition_id::` 前缀），用成交里 **`asset → slug`** 映射对齐 Gamma。**2.5**：**`net_pnl_settlement`**、**`net_pnl`** 定义见上。**2.4** / **2.3**：略。
+当前发布 **`schema_version: "2.5.2"`**（旧缓存可能仍为 `2.5.1` 及更早）。**2.5.2**：**`frontend.trade_ledger`** — 时间序逐笔台账（Data API 每笔成交 BUY/SELL + 已 resolve 持仓的 **SETTLEMENT** 行；字段含买入/卖出侧价额与本行 **`pnl`**）。**2.5.1**：结算 PnL 补齐 **`asset:{token}`** 库存键。**2.5**：**`net_pnl_settlement`**、**`net_pnl`**。**2.4** / **2.3**：略。
 
 | 块 | 说明 |
 |----|------|
@@ -672,7 +672,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 | **`trading_patterns`** | **`grid_like_market_ratio`**、**`win_rate_closed_positions`**（样本 ≥5 时）、**`closed_positions_sample_size`** |
 | **`strategy_inference`** | `src/strategy.rs`：**`high-frequency-grid-scalper`**（网格占比 >20% 且 entry P90 < 60s 等）；**`rule_json`** 含 `entry_window_sec_avg`、`preferred_price_ranges`、`jackpot_bias`、`multi_window_count` 等；更长的 **pseudocode** |
 | **`price_buckets_chart`** | 固定区间 + `label`（`<0.1`、`0.1–0.3`…），便于前端图表轴一致 |
-| **`frontend`** | **`biggest_wins` / `biggest_losses`**（按 **`pnl`** 排序：单笔**已实现**盈亏，平均成本法；买为 0）、**`recent_trades`**、**`current_positions`**、**`ai_copy_prompt`** |
+| **`frontend`** | **`biggest_wins` / `biggest_losses`**（按 **`pnl`** 排序：单笔**已实现**盈亏，平均成本法；买为 0）、**`recent_trades`**、**`trade_ledger`**（2.5.2+，逐笔台账）、**`current_positions`**、**`ai_copy_prompt`** |
 | **`gamma_profile`** | Gamma **`/public-profile`**：`display_name`、`username`、`avatar_url`、`created_at`、`bio`、`verified_badge`、`proxy_wallet`、`x_username`（有则填） |
 
 仍包含：`wallet`、**`trades_count`**（2.4+ 为市场数）、**`trades_fill_count`**（2.4+）、**`report_updated_at`**（RFC3339 UTC：新算为生成时刻；读缓存时取 PG `updated_at`）、`total_volume`、`market_distribution`、`price_buckets`、`trading_patterns`、`notes`、`data_fetch`、`ingestion`（含 **`truncation`**）、`subgraph`、`reconciliation`、`reconciliation_v1`、`canonical_summary`、`data_lineage`、**`provenance`**、**`metrics_canonical_shadow`**。

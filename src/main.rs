@@ -25,9 +25,10 @@ use polymarket_account_analyzer::{
         FrontendPresentation, GammaProfileSummary, IngestionMeta, IngestionTruncation,
         LifetimeMetrics, MarketDistributionItem, NormalizedPriceBucket, PositionRowDisplay,
         ReportProvenance, SideBias, StrategyInference, TimeAnalysis, TradeHighlight,
+        TradeLedgerRow,
         TradingPatterns, WinRateByMarketType,
     },
-    settlement_pnl::{settlement_breakdown_for_open_book, GammaResolutionPayouts},
+    settlement_pnl::{settlement_legs_for_open_book, GammaResolutionPayouts, SettlementLeg},
     storage::{Storage, WalletPipelineSnapshotMeta},
     strategy::{self, StrategyInputs},
     trade_pnl,
@@ -56,6 +57,91 @@ fn trade_ts_sec(t: &Trade) -> i64 {
     } else {
         ts
     }
+}
+
+fn trade_ts_ms(t: &Trade) -> i64 {
+    let ts = t.timestamp;
+    if ts > 1_000_000_000_000 {
+        ts
+    } else {
+        ts * 1000
+    }
+}
+
+/// 时间序台账：每条 `/trades` 一行 + 已 resolve 的 **SETTLEMENT** 行（与 `net_pnl` 口径一致）。
+fn build_trade_ledger(
+    trades: &[Trade],
+    per_trade_pnl: &[f64],
+    settlement_legs: &[SettlementLeg],
+    resolution_ts_by_slug: &HashMap<String, i64>,
+) -> Vec<TradeLedgerRow> {
+    let last_fill_ms = trades.iter().map(trade_ts_ms).max().unwrap_or(0);
+    let mut rows = Vec::with_capacity(trades.len() + settlement_legs.len());
+    for (i, t) in trades.iter().enumerate() {
+        let ts_ms = trade_ts_ms(t);
+        let size = t.size;
+        let price = t.price;
+        let pnl = per_trade_pnl.get(i).copied().unwrap_or(0.0);
+        let (row_kind, buy_price, buy_total, sell_price, sell_total) = match t.side {
+            TradeSide::Buy => {
+                let bt = size * price;
+                ("BUY".to_string(), price, bt, 0.0, 0.0)
+            }
+            TradeSide::Sell => {
+                let st = size * price;
+                let avg = if size > 1e-12 && price.is_finite() {
+                    price - pnl / size
+                } else {
+                    price
+                };
+                let bt = size * avg;
+                ("SELL".to_string(), avg, bt, price, st)
+            }
+        };
+        rows.push(TradeLedgerRow {
+            ts_ms,
+            slug: t.slug.clone(),
+            condition_id: t.condition_id.clone(),
+            outcome: t.outcome.clone(),
+            row_kind,
+            size,
+            buy_price,
+            buy_total,
+            sell_price,
+            sell_total,
+            pnl,
+            title: t.title.clone(),
+        });
+    }
+    for leg in settlement_legs {
+        let ts_ms = resolution_ts_by_slug
+            .get(&leg.slug)
+            .map(|sec| (*sec).saturating_mul(1000))
+            .filter(|&ms| ms > 0)
+            .unwrap_or(last_fill_ms);
+        let buy_total = leg.shares * leg.avg_entry_price;
+        let sell_total = leg.shares * leg.payout_per_share;
+        rows.push(TradeLedgerRow {
+            ts_ms,
+            slug: leg.slug.clone(),
+            condition_id: String::new(),
+            outcome: None,
+            row_kind: "SETTLEMENT".to_string(),
+            size: leg.shares,
+            buy_price: leg.avg_entry_price,
+            buy_total,
+            sell_price: leg.payout_per_share,
+            sell_total,
+            pnl: leg.pnl,
+            title: None,
+        });
+    }
+    rows.sort_by(|a, b| {
+        a.ts_ms
+            .cmp(&b.ts_ms)
+            .then_with(|| a.row_kind.cmp(&b.row_kind))
+    });
+    rows
 }
 
 fn percentile_i64_sorted(sorted: &[i64], p: f64) -> Option<f64> {
@@ -111,6 +197,7 @@ fn build_frontend_presentation(
     primary_style: &str,
     win_rate: f64,
     total_vol: f64,
+    trade_ledger: Vec<TradeLedgerRow>,
 ) -> FrontendPresentation {
     let mut scored: Vec<TradeHighlight> = trades
         .iter()
@@ -186,6 +273,7 @@ fn build_frontend_presentation(
         biggest_losses: losses,
         recent_trades: recent,
         current_positions,
+        trade_ledger,
         ai_copy_prompt,
     }
 }
@@ -1473,13 +1561,23 @@ fn build_report(
             }
         }
     }
-    let settlement = settlement_breakdown_for_open_book(
+    let settlement_legs_vec = settlement_legs_for_open_book(
         &book,
         &augment.gamma_resolution_by_slug,
         &condition_to_slug,
         &asset_to_slug,
     );
-    let net_pnl_settlement = settlement.total;
+    let net_pnl_settlement: f64 = settlement_legs_vec.iter().map(|l| l.pnl).sum();
+    let max_settlement_win = settlement_legs_vec
+        .iter()
+        .map(|l| l.pnl)
+        .fold(0.0_f64, f64::max);
+    let mut min_settlement_loss = 0.0_f64;
+    for l in &settlement_legs_vec {
+        if l.pnl < min_settlement_loss {
+            min_settlement_loss = l.pnl;
+        }
+    }
     let lifetime_net_pnl = net_pnl_realized_trades + net_pnl_settlement;
 
     let mut total_volume = 0.0_f64;
@@ -1568,14 +1666,14 @@ fn build_report(
         .filter(|x| *x > 0.0)
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(0.0)
-        .max(settlement.max_leg_win);
+        .max(max_settlement_win);
     max_single_loss = per_trade_pnl
         .iter()
         .cloned()
         .filter(|x| *x < 0.0)
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(0.0)
-        .min(settlement.min_leg_loss);
+        .min(min_settlement_loss);
 
     let total_volume_nonzero = if total_volume == 0.0 { 1.0 } else { total_volume };
     let mut market_distribution: Vec<MarketDistributionItem> = dist
@@ -1733,6 +1831,12 @@ fn build_report(
         },
     ]);
 
+    let trade_ledger = build_trade_ledger(
+        trades,
+        &per_trade_pnl,
+        &settlement_legs_vec,
+        &augment.resolution_ts_by_slug,
+    );
     let frontend = Some(build_frontend_presentation(
         wallet,
         trades,
@@ -1741,6 +1845,7 @@ fn build_report(
         &primary_style,
         win_rate_overall,
         total_volume,
+        trade_ledger,
     ));
 
     let open_position_value: f64 = augment
@@ -1756,7 +1861,7 @@ fn build_report(
     let open_positions_count = augment.open_positions.len();
 
     AnalyzeReport {
-        schema_version: "2.5.1".to_string(),
+        schema_version: "2.5.2".to_string(),
         wallet: wallet.to_string(),
         trades_count: distinct_slugs_count,
         trades_fill_count: trade_fills_count,
@@ -1816,12 +1921,16 @@ fn build_report(
                         .unwrap_or_else(|| "unknown".to_string())
                 ));
             }
-            if settlement.legs_used > 0 {
+            if !settlement_legs_vec.is_empty() {
                 notes.push(format!(
                     "net_pnl_settlement: {} ({} resolved open leg(s) matched via Gamma outcomePrices).",
-                    net_pnl_settlement, settlement.legs_used
+                    net_pnl_settlement,
+                    settlement_legs_vec.len()
                 ));
             }
+            notes.push(
+                "frontend.trade_ledger: chronological rows (BUY/SELL per Data API fill; SETTLEMENT = resolve payout on remaining shares). Sum of `pnl` ≈ lifetime.net_pnl when fills + settlements complete the book.".into(),
+            );
             notes
         },
         report_updated_at: Some(Utc::now().to_rfc3339()),
