@@ -24,9 +24,8 @@ use polymarket_account_analyzer::{
         AnalyzeReport, CanonicalSummary, DataApiTruncationMeta, DataFetchMeta, DataLineage,
         FrontendPresentation, GammaProfileSummary, IngestionMeta, IngestionTruncation,
         LifetimeMetrics, MarketDistributionItem, NormalizedPriceBucket, PositionRowDisplay,
-        ReportProvenance, SideBias, StrategyInference, TimeAnalysis, TradeHighlight,
-        TradeLedgerRow,
-        TradingPatterns, WinRateByMarketType,
+        ReportProvenance, REPORT_SCHEMA_VERSION, SideBias, StrategyInference, TimeAnalysis,
+        TradeHighlight, TradeLedgerRow, TradingPatterns, WinRateByMarketType,
     },
     settlement_pnl::{settlement_legs_for_open_book, GammaResolutionPayouts, SettlementLeg},
     storage::{Storage, WalletPipelineSnapshotMeta},
@@ -1861,7 +1860,7 @@ fn build_report(
     let open_positions_count = augment.open_positions.len();
 
     AnalyzeReport {
-        schema_version: "2.5.2".to_string(),
+        schema_version: REPORT_SCHEMA_VERSION.to_string(),
         wallet: wallet.to_string(),
         trades_count: distinct_slugs_count,
         trades_fill_count: trade_fills_count,
@@ -2102,6 +2101,15 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         "ok"
     }
 
+    /// 部署验收：返回**当前二进制**将写入报告的 `schema_version`（与完整跑一遍 analyze 一致）。
+    async fn version_handler() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "ok": true,
+            "report_schema_version": REPORT_SCHEMA_VERSION,
+            "package_version": env!("CARGO_PKG_VERSION"),
+        }))
+    }
+
     fn is_valid_analyze_wallet_path(s: &str) -> bool {
         let s = s.trim();
         let Some(rest) = s.strip_prefix("0x") else {
@@ -2162,6 +2170,7 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
 
     let mut app = Router::new()
         .route("/health", get(health_handler))
+        .route("/version", get(version_handler))
         .route("/gamma-public-profile/:wallet", get(gamma_public_profile_handler))
         .route("/analyze/:wallet", get(analyze_handler))
         .route("/leaderboard", get(leaderboard_handler))

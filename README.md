@@ -398,6 +398,8 @@ api.forevex.trade {
 3. **先测健康检查**（**秒回**，不连数据库、不拉 Data API）：  
    `curl -v --max-time 5 http://127.0.0.1:3000/health`  
    应返回 **`ok`**。若本机都失败，说明服务没起来或端口不是 3000。
+3b. **确认二进制报告 schema**（与「同步了代码但 `analyze` 仍返回旧 `schema_version`」排查）：  
+   `curl -sS http://127.0.0.1:3000/version` → JSON 里的 **`report_schema_version`** 应为当前发布（如 **`2.5.2`**）。若此处仍是 **`2.5.1`**，说明**跑的还是旧镜像/旧二进制**（需 **`docker compose build --no-cache`** 或重新发布产物），而非仅「刷新了页面」。
 4. **`/analyze` 可能很慢**：会从 Polymarket Data API 等拉数据，**几分钟都正常**；`curl` **要等整份 JSON 响应结束**才会把 body 给你，期间终端可能**长时间没有输出**。请加大超时，例如：  
    `curl -v --max-time 600 "http://127.0.0.1:3000/analyze/0x你的地址" | head -c 500`
 5. **从你电脑访问 `http://54.x.x.x:3000` 一直卡住**：检查云厂商 **安全组入站**、Linux **`sudo ufw status`**，是否放行 **TCP 3000**；可用 `curl -v --max-time 10 http://54.x.x.x:3000/health` 先测（部署了新版本才有 `/health`，旧镜像需 `docker compose up --build -d` 重建）。

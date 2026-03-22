@@ -3,6 +3,9 @@ use crate::reconciliation::ReconciliationSummary;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// 新算报告根字段 `schema_version`；与 README / 前端说明对齐，变更时同步 bump。
+pub const REPORT_SCHEMA_VERSION: &str = "2.5.2";
+
 fn default_schema_version() -> String {
     // Legacy cached reports without this field deserialize as 1.0.0; new runs set 2.0.0 in `build_report`.
     "1.0.0".to_string()
