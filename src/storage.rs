@@ -1701,19 +1701,35 @@ impl Storage {
             .transpose()
             .context("serialize reconciliation v1")?;
 
-        sqlx::query(
-            r#"
-            DELETE FROM wallet_pipeline_meta WHERE lower(wallet) = lower($1::text);
-            DELETE FROM wallet_reconciliation_current WHERE lower(wallet) = lower($1::text);
-            DELETE FROM wallet_frontend_current WHERE lower(wallet) = lower($1::text);
-            DELETE FROM wallet_strategy_current WHERE lower(wallet) = lower($1::text);
-            DELETE FROM wallet_report_snapshot WHERE lower(wallet) = lower($1::text);
-            "#,
-        )
-        .bind(&wallet_lc)
-        .execute(&mut *tx)
-        .await
-        .context("delete wallet pipeline meta / json snapshots (casing dedup)")?;
+        // One statement per execute: Postgres prepared statements cannot contain multiple commands.
+        for (sql, ctx) in [
+            (
+                "DELETE FROM wallet_pipeline_meta WHERE lower(wallet) = lower($1::text)",
+                "delete wallet_pipeline_meta (casing dedup)",
+            ),
+            (
+                "DELETE FROM wallet_reconciliation_current WHERE lower(wallet) = lower($1::text)",
+                "delete wallet_reconciliation_current (casing dedup)",
+            ),
+            (
+                "DELETE FROM wallet_frontend_current WHERE lower(wallet) = lower($1::text)",
+                "delete wallet_frontend_current (casing dedup)",
+            ),
+            (
+                "DELETE FROM wallet_strategy_current WHERE lower(wallet) = lower($1::text)",
+                "delete wallet_strategy_current (casing dedup)",
+            ),
+            (
+                "DELETE FROM wallet_report_snapshot WHERE lower(wallet) = lower($1::text)",
+                "delete wallet_report_snapshot (casing dedup)",
+            ),
+        ] {
+            sqlx::query(sql)
+                .bind(&wallet_lc)
+                .execute(&mut *tx)
+                .await
+                .context(ctx)?;
+        }
 
         sqlx::query(
             r#"
