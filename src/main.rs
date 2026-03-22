@@ -644,7 +644,7 @@ async fn analyze_wallet(
                             let data_hit = DataApiClient::new(http_hit, rate_hit);
                             if let Ok((delta, _, _)) = data_hit
                                 .trades_since_watermark(
-                                    wallet,
+                                    &w,
                                     cfg.trades_page_limit,
                                     wm,
                                     cfg.ingestion.data_api_incremental_max_pages,

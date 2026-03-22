@@ -664,7 +664,7 @@ impl Storage {
             SELECT side, size, price, condition_id, slug, title, outcome, timestamp_ms,
                    transaction_hash, asset, event_slug, outcome_index, proxy_wallet
             FROM wallet_primary_trade_row
-            WHERE wallet = $1
+            WHERE lower(wallet) = lower($1::text)
             ORDER BY seq ASC
             "#,
         )
@@ -708,7 +708,7 @@ impl Storage {
             r#"
             SELECT canonical_id, event_type, occurred_at, condition_id, market_slug, amounts, source_refs
             FROM wallet_canonical_event_row
-            WHERE wallet = $1
+            WHERE lower(wallet) = lower($1::text)
             ORDER BY seq ASC
             "#,
         )
@@ -1571,6 +1571,8 @@ impl Storage {
 
     /// Replace wallet-scoped snapshots used for SQL/BI and staged downstream work (`raw → canonical → reconciliation → report`).
     /// **Deletes** prior rows for this wallet under `wallet_primary_trade_row` / `wallet_canonical_event_row`, then **upserts** meta + JSON tables.
+    /// Uses `pg_advisory_xact_lock` per wallet to avoid concurrent `analyze` interleaving DELETE/INSERT (duplicate `(wallet,seq)`).
+    /// Wallet keys are normalized to **lowercase**; deletes match `lower(wallet)` so mixed-case historical rows are cleared.
     pub async fn replace_wallet_pipeline_snapshots(
         &self,
         wallet: &str,
@@ -1584,10 +1586,20 @@ impl Storage {
             anyhow::bail!("trades / trade_pnls length mismatch for wallet pipeline snapshots");
         }
 
+        let wallet_lc = wallet.to_lowercase();
+
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM wallet_primary_trade_row WHERE wallet = $1")
-            .bind(wallet)
+        // Serialize same-wallet snapshot replaces (concurrent analyze / cache-hit refresh).
+        sqlx::query(r#"SELECT pg_advisory_xact_lock(914001, hashtext(lower($1::text)))"#)
+            .bind(&wallet_lc)
+            .execute(&mut *tx)
+            .await
+            .context("advisory lock replace_wallet_pipeline_snapshots")?;
+
+        // Match any historical wallet casing; re-insert only lowercase keys.
+        sqlx::query("DELETE FROM wallet_primary_trade_row WHERE lower(wallet) = lower($1::text)")
+            .bind(&wallet_lc)
             .execute(&mut *tx)
             .await
             .context("delete wallet_primary_trade_row")?;
@@ -1618,7 +1630,7 @@ impl Storage {
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 "#,
             )
-            .bind(wallet)
+            .bind(&wallet_lc)
             .bind(seq)
             .bind(&meta.analytics_lane)
             .bind(side_s)
@@ -1643,8 +1655,8 @@ impl Storage {
             .context("insert wallet_primary_trade_row")?;
         }
 
-        sqlx::query("DELETE FROM wallet_canonical_event_row WHERE wallet = $1")
-            .bind(wallet)
+        sqlx::query("DELETE FROM wallet_canonical_event_row WHERE lower(wallet) = lower($1::text)")
+            .bind(&wallet_lc)
             .execute(&mut *tx)
             .await
             .context("delete wallet_canonical_event_row")?;
@@ -1661,7 +1673,7 @@ impl Storage {
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     "#,
                 )
-                .bind(wallet)
+                .bind(&wallet_lc)
                 .bind(seq)
                 .bind(e.id)
                 .bind(&e.event_type)
@@ -1691,6 +1703,20 @@ impl Storage {
 
         sqlx::query(
             r#"
+            DELETE FROM wallet_pipeline_meta WHERE lower(wallet) = lower($1::text);
+            DELETE FROM wallet_reconciliation_current WHERE lower(wallet) = lower($1::text);
+            DELETE FROM wallet_frontend_current WHERE lower(wallet) = lower($1::text);
+            DELETE FROM wallet_strategy_current WHERE lower(wallet) = lower($1::text);
+            DELETE FROM wallet_report_snapshot WHERE lower(wallet) = lower($1::text);
+            "#,
+        )
+        .bind(&wallet_lc)
+        .execute(&mut *tx)
+        .await
+        .context("delete wallet pipeline meta / json snapshots (casing dedup)")?;
+
+        sqlx::query(
+            r#"
             INSERT INTO wallet_pipeline_meta (
                 wallet, last_ingestion_run_id, analytics_lane, cache_key, schema_version,
                 data_api_truncated, data_api_max_offset_allowed, data_api_trade_watermark_ms, updated_at
@@ -1707,7 +1733,7 @@ impl Storage {
                 updated_at = NOW()
             "#,
         )
-        .bind(wallet)
+        .bind(&wallet_lc)
         .bind(&meta.last_ingestion_run_id)
         .bind(&meta.analytics_lane)
         .bind(&meta.cache_key)
@@ -1730,7 +1756,7 @@ impl Storage {
                 updated_at = NOW()
             "#,
         )
-        .bind(wallet)
+        .bind(&wallet_lc)
         .bind(v0_json)
         .bind(v1_json)
         .bind(&meta.last_ingestion_run_id)
@@ -1754,7 +1780,7 @@ impl Storage {
                 updated_at = NOW()
             "#,
         )
-        .bind(wallet)
+        .bind(&wallet_lc)
         .bind(frontend_json)
         .execute(&mut *tx)
         .await
@@ -1772,7 +1798,7 @@ impl Storage {
                 updated_at = NOW()
             "#,
         )
-        .bind(wallet)
+        .bind(&wallet_lc)
         .bind(strategy_json)
         .execute(&mut *tx)
         .await
@@ -1790,7 +1816,7 @@ impl Storage {
                 updated_at = NOW()
             "#,
         )
-        .bind(wallet)
+        .bind(&wallet_lc)
         .bind(&meta.cache_key)
         .bind(report_json)
         .execute(&mut *tx)
