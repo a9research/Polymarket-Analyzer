@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// 新算报告根字段 `schema_version`；与 README / 前端说明对齐，变更时同步 bump。
-pub const REPORT_SCHEMA_VERSION: &str = "2.5.5";
+pub const REPORT_SCHEMA_VERSION: &str = "2.7.0";
 
 fn default_schema_version() -> String {
     // Legacy cached reports without this field deserialize as 1.0.0; new runs set 2.0.0 in `build_report`.
@@ -242,6 +242,9 @@ pub struct GammaProfileSummary {
 pub struct AnalyzeReport {
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
+    /// e.g. **`account`**: metrics from Data API **`/positions` + `/closed-positions`** only (no `/trades` in analyze).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_pipeline: Option<String>,
     pub wallet: String,
     /// Distinct markets: unique non-empty `slug` (else `condition_id`), aligned with Polymarket
     /// `user-stats.trades` for typical accounts.
@@ -278,7 +281,7 @@ pub struct AnalyzeReport {
     /// Per-block analytics source (§1.5.4 / §1.5.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ReportProvenance>,
-    /// When canonical merge ran and `analytics.canonical_shadow`, compares to primary metrics.
+    /// Present when canonical merge + shadow metrics ran (e.g. PG replay / trades path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_canonical_shadow: Option<CanonicalShadowMetrics>,
     /// Same buckets as `price_buckets` with human labels for charts.

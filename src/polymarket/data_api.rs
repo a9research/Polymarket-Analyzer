@@ -253,6 +253,91 @@ impl DataApiClient {
         Ok(out)
     }
 
+    /// `GET /activity` — user event stream (TRADE / MERGE / REDEEM / …). Optional `market` = condition id.
+    /// `start` / `end`: Unix seconds filters per Polymarket Data API OpenAPI.
+    pub async fn activity_page(
+        &self,
+        wallet: &str,
+        market_condition_id: Option<&str>,
+        limit: u32,
+        offset: u32,
+        start_ts_sec: Option<i64>,
+        end_ts_sec: Option<i64>,
+    ) -> anyhow::Result<Vec<Activity>> {
+        let url = format!("{}/activity", self.base_url);
+        let lim = limit.clamp(1, 500);
+        let off = offset.min(10_000);
+        let mut req = self.http.get(&url).query(&[
+            ("user", wallet),
+            ("limit", &lim.to_string()),
+            ("offset", &off.to_string()),
+        ]);
+        if let Some(m) = market_condition_id.filter(|s| !s.trim().is_empty()) {
+            req = req.query(&[("market", m)]);
+        }
+        if let Some(s) = start_ts_sec {
+            req = req.query(&[("start", &s.to_string())]);
+        }
+        if let Some(e) = end_ts_sec {
+            req = req.query(&[("end", &e.to_string())]);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            anyhow::bail!("data-api /activity status={status} body={body}");
+        }
+        Ok(resp.json::<Vec<Activity>>().await.unwrap_or_default())
+    }
+
+    /// Paginate `/activity` for one `market` (condition id) until empty or offset cap.
+    pub async fn activity_all_for_market(
+        &self,
+        wallet: &str,
+        market_condition_id: &str,
+        page_limit: u32,
+        start_ts_sec: Option<i64>,
+    ) -> anyhow::Result<Vec<Activity>> {
+        let mut out = Vec::new();
+        let mut offset: u32 = 0;
+        let limit = page_limit.clamp(1, 500);
+        loop {
+            let page = self
+                .activity_page(
+                    wallet,
+                    Some(market_condition_id),
+                    limit,
+                    offset,
+                    start_ts_sec,
+                    None,
+                )
+                .await
+                .with_context(|| format!("activity market={market_condition_id} offset={offset}"))?;
+            if page.is_empty() {
+                break;
+            }
+            let n = page.len();
+            out.extend(page);
+            if n < limit as usize {
+                break;
+            }
+            offset = offset.saturating_add(limit);
+            if offset > 10_000 {
+                tracing::warn!(
+                    wallet,
+                    market = market_condition_id,
+                    "data-api /activity offset>10000; stopping pagination"
+                );
+                break;
+            }
+            tokio::time::sleep(self.rate_limit).await;
+        }
+        Ok(out)
+    }
+
     async fn user_json_page<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -345,6 +430,90 @@ fn anyhow_error_chain_text(e: &anyhow::Error) -> String {
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Data API `GET /activity` row (subset; extra fields ignored).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    #[serde(default)]
+    pub proxy_wallet: Option<String>,
+    #[serde(default)]
+    pub timestamp: i64,
+    #[serde(default)]
+    pub condition_id: Option<String>,
+    /// TRADE, SPLIT, MERGE, REDEEM, REWARD, CONVERSION, MAKER_REBATE
+    #[serde(default, rename = "type")]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<f64>,
+    #[serde(default)]
+    pub usdc_size: Option<f64>,
+    #[serde(default)]
+    pub transaction_hash: Option<String>,
+    #[serde(default)]
+    pub price: Option<f64>,
+    #[serde(default)]
+    pub asset: Option<String>,
+    #[serde(default)]
+    pub side: Option<String>,
+    #[serde(default)]
+    pub outcome_index: Option<i32>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub event_slug: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+/// Normalize activity `timestamp` to **Unix seconds** (API may return sec or ms).
+pub fn activity_ts_sec(a: &Activity) -> i64 {
+    let t = a.timestamp;
+    if t > 1_000_000_000_000 {
+        t / 1000
+    } else {
+        t
+    }
+}
+
+pub fn activity_dedup_key(a: &Activity) -> String {
+    if let Some(ref h) = a
+        .transaction_hash
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return format!("tx:{}", h.to_lowercase());
+    }
+    format!(
+        "raw:{}:{}:{}:{}:{}",
+        activity_ts_sec(a),
+        a.event_type.as_deref().unwrap_or(""),
+        a.size.map(|x| format!("{x:.10}")).unwrap_or_default(),
+        a.price.map(|x| format!("{x:.10}")).unwrap_or_default(),
+        a.side.as_deref().unwrap_or("")
+    )
+}
+
+pub fn merge_activities_incremental(existing: Vec<Activity>, delta: Vec<Activity>) -> Vec<Activity> {
+    let mut seen: std::collections::HashSet<String> =
+        existing.iter().map(activity_dedup_key).collect();
+    let mut out = existing;
+    for a in delta {
+        let k = activity_dedup_key(&a);
+        if seen.insert(k) {
+            out.push(a);
+        }
+    }
+    out.sort_by_key(activity_ts_sec);
+    out
+}
+
+pub fn max_activity_ts_sec(activities: &[Activity]) -> i64 {
+    activities.iter().map(activity_ts_sec).max().unwrap_or(0)
 }
 
 fn parse_max_offset_exceeded(msg: &str) -> Option<u32> {

@@ -2,24 +2,19 @@ use chrono::{DateTime, Timelike, Utc};
 use clap::{Args, Parser, Subcommand};
 use polymarket_account_analyzer::{
     canonical::{
-        build_canonical_merge, compute_shadow_metrics, normalize_condition_id,
-        slug_map_from_canonical_events, synthetic_trades_from_events, CanonicalPipelineParams,
+        compute_shadow_metrics, normalize_condition_id, slug_map_from_canonical_events,
+        synthetic_trades_from_events,
     },
-    config::{apply_env_overrides, load_config, report_cache_key, AppConfig, ReconciliationConfig},
+    config::{
+        apply_env_overrides, load_config, report_cache_key, AppConfig, ReconciliationConfig,
+    },
     polymarket::{
-        data_api::{
-            merge_trades_incremental, trade_timestamp_ms, wallet_trades_watermark_ms,
-            ClosedPosition, DataApiClient,
-            Trade, TradeSide, TradesAllResult, UserPosition,
-        },
+        data_api::{ClosedPosition, DataApiClient, Trade, TradeSide, UserPosition},
         gamma_api::GammaApiClient,
         gamma_taxonomy::GammaTaxonomy,
-        subgraph::{fetch_subgraph_for_wallet, SubgraphWalletParams},
     },
     reconciliation::{
-        extract_fills_rows, extract_redemption_rows, json_value_ts_secs, reconcile_v0,
-        shadow_volume_discrepancy_note, subgraph_fetch_failed_summary, summary_from_v1,
-        v1_coverage_alert_notes, ReconciliationSummary,
+        shadow_volume_discrepancy_note, summary_from_v1, v1_coverage_alert_notes,
     },
     report::{
         AnalyzeReport, CanonicalSummary, DataApiTruncationMeta, DataFetchMeta, DataLineage,
@@ -30,7 +25,7 @@ use polymarket_account_analyzer::{
         WinRateByMarketType,
     },
     settlement_pnl::{settlement_legs_for_open_book, GammaResolutionPayouts, SettlementLeg},
-    storage::{Storage, WalletPipelineSnapshotMeta},
+    storage::Storage,
     strategy::{self, StrategyInputs},
     trade_pnl,
 };
@@ -195,9 +190,9 @@ fn percentile_i64_sorted(sorted: &[i64], p: f64) -> Option<f64> {
     Some(sorted[idx.min(sorted.len() - 1)] as f64)
 }
 
-async fn fetch_gamma_context_for_trades(
+async fn fetch_gamma_context_for_slugs(
     gamma: &GammaApiClient,
-    trades: &[Trade],
+    slugs_source: &[String],
     max_slugs: usize,
     taxonomy: Option<&GammaTaxonomy>,
 ) -> (
@@ -208,9 +203,13 @@ async fn fetch_gamma_context_for_trades(
     if max_slugs == 0 {
         return (HashMap::new(), HashMap::new(), HashMap::new());
     }
-    let slugs_set: HashSet<String> = trades.iter().map(|t| t.slug.clone()).collect();
-    let mut slugs: Vec<String> = slugs_set.into_iter().collect();
+    let mut slugs: Vec<String> = slugs_source
+        .iter()
+        .cloned()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
     slugs.sort();
+    slugs.dedup();
     let mut resolution_ts_by_slug = HashMap::new();
     let mut gamma_resolution_by_slug = HashMap::new();
     let mut gamma_bucket_by_slug = HashMap::new();
@@ -247,6 +246,22 @@ async fn fetch_gamma_context_for_trades(
         gamma_resolution_by_slug,
         gamma_bucket_by_slug,
     )
+}
+
+fn slugs_from_positions(open: &[UserPosition], closed: &[ClosedPosition]) -> Vec<String> {
+    let mut v: Vec<String> = open
+        .iter()
+        .filter_map(|p| p.slug.as_ref().map(|s| s.trim().to_string()))
+        .chain(
+            closed
+                .iter()
+                .filter_map(|p| p.slug.as_ref().map(|s| s.trim().to_string())),
+        )
+        .filter(|s| !s.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 fn build_frontend_presentation(
@@ -393,54 +408,20 @@ struct Cli {
 
 #[derive(Debug, Args, Clone, Default)]
 struct AnalyzeCliFlags {
-    /// Enable subgraph fetch for this run (overrides `[subgraph].enabled = false`).
-    #[arg(long, default_value_t = false)]
-    with_subgraph: bool,
-    /// Disable subgraph for this run.
-    #[arg(long, default_value_t = false)]
-    no_subgraph: bool,
-    /// Cap each subgraph stream to N rows (0 = use config only).
-    #[arg(long)]
-    subgraph_cap_rows: Option<u32>,
-    /// Enable v0 reconciliation (overrides `[reconciliation].enabled = false`).
-    #[arg(long, default_value_t = false)]
-    with_reconciliation: bool,
-    /// Disable reconciliation for this run.
-    #[arg(long, default_value_t = false)]
-    no_reconciliation: bool,
     /// Skip writing raw chunks to Postgres for this run.
     #[arg(long, default_value_t = false)]
     no_persist_raw: bool,
-    /// Enable canonical merge + Postgres persistence (requires `persist_raw` + DB).
-    #[arg(long, default_value_t = false)]
-    with_canonical: bool,
-    #[arg(long, default_value_t = false)]
-    no_canonical: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct AnalyzeOverrides {
-    with_subgraph: bool,
-    no_subgraph: bool,
-    subgraph_cap_rows: Option<u32>,
-    with_reconciliation: bool,
-    no_reconciliation: bool,
     no_persist_raw: bool,
-    with_canonical: bool,
-    no_canonical: bool,
 }
 
 impl From<&AnalyzeCliFlags> for AnalyzeOverrides {
     fn from(f: &AnalyzeCliFlags) -> Self {
         Self {
-            with_subgraph: f.with_subgraph,
-            no_subgraph: f.no_subgraph,
-            subgraph_cap_rows: f.subgraph_cap_rows,
-            with_reconciliation: f.with_reconciliation,
-            no_reconciliation: f.no_reconciliation,
             no_persist_raw: f.no_persist_raw,
-            with_canonical: f.with_canonical,
-            no_canonical: f.no_canonical,
         }
     }
 }
@@ -453,21 +434,7 @@ struct AnalyzeQuery {
     #[serde(default)]
     cached_only: bool,
     #[serde(default)]
-    with_subgraph: bool,
-    #[serde(default)]
-    no_subgraph: bool,
-    #[serde(default)]
-    subgraph_cap_rows: Option<u32>,
-    #[serde(default)]
-    with_reconciliation: bool,
-    #[serde(default)]
-    no_reconciliation: bool,
-    #[serde(default)]
     no_persist_raw: bool,
-    #[serde(default)]
-    with_canonical: bool,
-    #[serde(default)]
-    no_canonical: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -483,40 +450,15 @@ struct LeaderboardQuery {
 impl From<&AnalyzeQuery> for AnalyzeOverrides {
     fn from(q: &AnalyzeQuery) -> Self {
         Self {
-            with_subgraph: q.with_subgraph,
-            no_subgraph: q.no_subgraph,
-            subgraph_cap_rows: q.subgraph_cap_rows,
-            with_reconciliation: q.with_reconciliation,
-            no_reconciliation: q.no_reconciliation,
             no_persist_raw: q.no_persist_raw,
-            with_canonical: q.with_canonical,
-            no_canonical: q.no_canonical,
         }
     }
 }
 
 fn effective_config(base: &AppConfig, o: &AnalyzeOverrides) -> AppConfig {
     let mut c = base.clone();
-    if o.no_subgraph {
-        c.subgraph.enabled = false;
-    } else if o.with_subgraph {
-        c.subgraph.enabled = true;
-    }
-    if let Some(cap) = o.subgraph_cap_rows {
-        c.subgraph.cap_rows_per_stream = cap;
-    }
-    if o.no_reconciliation {
-        c.reconciliation.enabled = false;
-    } else if o.with_reconciliation {
-        c.reconciliation.enabled = true;
-    }
     if o.no_persist_raw {
         c.ingestion.persist_raw = false;
-    }
-    if o.no_canonical {
-        c.canonical.enabled = false;
-    } else if o.with_canonical {
-        c.canonical.enabled = true;
     }
     c
 }
@@ -685,7 +627,7 @@ async fn report_from_canonical_pg_run(
         );
     }
 
-    let mut report = build_report(
+    let mut report = build_report_from_trades(
         cfg,
         &wallet,
         &synth,
@@ -775,7 +717,7 @@ async fn report_from_canonical_pg_run(
     Ok(report)
 }
 
-/// Incremental trades + snapshot refresh after a cache hit (runs off the HTTP critical path).
+/// Refresh wallet snapshot JSON after analyze cache hit (background).
 async fn wallet_refresh_after_cache_hit(
     store: Storage,
     cfg: AppConfig,
@@ -786,97 +728,11 @@ async fn wallet_refresh_after_cache_hit(
     if !cfg.ingestion.persist_wallet_snapshots {
         return;
     }
-    let mut refreshed_trades_on_hit = false;
-    if cfg.ingestion.data_api_incremental_trades {
-        let prev = store
-            .fetch_wallet_primary_trades(&wallet_lc)
-            .await
-            .unwrap_or_default();
-        if let Some(wm) = wallet_trades_watermark_ms(&prev) {
-            let timeout = Duration::from_secs(cfg.timeout_sec.max(10));
-            let Ok(http_hit) = Client::builder()
-                .user_agent("polymarket-account-analyzer/0.1")
-                .timeout(timeout)
-                .connect_timeout(Duration::from_secs(15))
-                .no_proxy()
-                .build()
-            else {
-                tracing::warn!("cache-hit refresh: build http client failed");
-                return;
-            };
-            let rate_hit = Duration::from_millis(cfg.rate_limit_ms);
-            let data_hit = DataApiClient::new(http_hit, rate_hit);
-            if let Ok((delta, _, _)) = data_hit
-                .trades_since_watermark(
-                    &wallet_lc,
-                    cfg.trades_page_limit,
-                    wm,
-                    cfg.ingestion.data_api_incremental_max_pages,
-                )
-                .await
-            {
-                if !delta.is_empty() {
-                    let merged = merge_trades_incremental(prev, delta);
-                    let pnls = trade_pnl::per_trade_realized_pnl(&merged);
-                    let canon = store
-                        .fetch_wallet_canonical_event_rows(&wallet_lc)
-                        .await
-                        .unwrap_or_default();
-                    let canon_opt = if canon.is_empty() {
-                        None
-                    } else {
-                        Some(canon.as_slice())
-                    };
-                    let snap_meta = WalletPipelineSnapshotMeta {
-                        last_ingestion_run_id: cached
-                            .ingestion
-                            .as_ref()
-                            .and_then(|i| i.run_id.clone()),
-                        analytics_lane: cached
-                            .data_lineage
-                            .as_ref()
-                            .map(|d| d.analytics_primary_source.clone())
-                            .unwrap_or_else(|| "data_api_trades".to_string()),
-                        cache_key: cache_key.clone(),
-                        schema_version: cached.schema_version.clone(),
-                        data_api_truncated: cached.data_fetch.truncated,
-                        data_api_max_offset_allowed: cached
-                            .data_fetch
-                            .max_offset_allowed
-                            .and_then(|x| i32::try_from(x).ok()),
-                        data_api_trade_watermark_ms: merged
-                            .iter()
-                            .map(|t| trade_timestamp_ms(t.timestamp))
-                            .max(),
-                    };
-                    if let Err(e) = store
-                        .replace_wallet_pipeline_snapshots(
-                            &wallet_lc,
-                            &snap_meta,
-                            &merged,
-                            &pnls,
-                            canon_opt,
-                            &cached,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            "replace_wallet_pipeline_snapshots (cache-hit incremental): {e:#}"
-                        );
-                    } else {
-                        refreshed_trades_on_hit = true;
-                    }
-                }
-            }
-        }
-    }
-    if !refreshed_trades_on_hit {
-        if let Err(e) = store
-            .refresh_wallet_snapshots_after_cache_hit(&wallet_lc, &cache_key, &cached)
-            .await
-        {
-            tracing::warn!("refresh_wallet_snapshots_after_cache_hit: {e:#}");
-        }
+    if let Err(e) = store
+        .refresh_wallet_snapshots_after_cache_hit(&wallet_lc, &cache_key, &cached)
+        .await
+    {
+        tracing::warn!("refresh_wallet_snapshots_after_cache_hit: {e:#}");
     }
 }
 
@@ -902,8 +758,7 @@ async fn analyze_wallet(
                     let ck_cl = cache_key.clone();
                     let cached_cl = cached.clone();
                     tokio::spawn(async move {
-                        wallet_refresh_after_cache_hit(store_cl, cfg_cl, w_cl, ck_cl, cached_cl)
-                            .await;
+                        wallet_refresh_after_cache_hit(store_cl, cfg_cl, w_cl, ck_cl, cached_cl).await;
                     });
                 }
                 return Ok(cached);
@@ -918,12 +773,10 @@ async fn analyze_wallet(
     }
 
     let params_snapshot = serde_json::json!({
-        "subgraph": cfg.subgraph,
-        "reconciliation": cfg.reconciliation,
         "ingestion": cfg.ingestion,
-        "canonical": cfg.canonical,
-        "analytics": cfg.analytics,
         "trades_page_limit": cfg.trades_page_limit,
+        "market_type": cfg.market_type,
+        "analyzer": "account_positions_v1",
     });
 
     let mut run_id: Option<Uuid> = None;
@@ -952,89 +805,6 @@ async fn analyze_wallet(
 
     let rate = Duration::from_millis(cfg.rate_limit_ms);
     let data = DataApiClient::new(http.clone(), rate);
-
-    let trades_result: TradesAllResult =
-        if cfg.ingestion.data_api_incremental_trades && storage.is_some() {
-            let store = storage.expect("incremental trades implies storage");
-            let prev = store
-                .fetch_wallet_primary_trades(&w)
-                .await
-                .unwrap_or_default();
-            if prev.is_empty() {
-                data.trades_all(wallet, cfg.trades_page_limit).await?
-            } else if let Some(wm) = wallet_trades_watermark_ms(&prev) {
-                let (delta, inc_trunc, max_off) = data
-                    .trades_since_watermark(
-                        wallet,
-                        cfg.trades_page_limit,
-                        wm,
-                        cfg.ingestion.data_api_incremental_max_pages,
-                    )
-                    .await?;
-                let delta_count = delta.len();
-                let merged = merge_trades_incremental(prev, delta);
-                TradesAllResult {
-                    trades: merged,
-                    truncated: inc_trunc,
-                    max_offset_allowed: max_off,
-                    fetched_incrementally: true,
-                    incremental_api_delta_count: delta_count,
-                }
-            } else {
-                data.trades_all(wallet, cfg.trades_page_limit).await?
-            }
-        } else {
-            data.trades_all(wallet, cfg.trades_page_limit).await?
-        };
-
-    if let (Some(store), Some(rid)) = (storage, run_id) {
-        let step = cfg.trades_page_limit.max(1) as usize;
-        for (i, chunk) in trades_result.trades.chunks(step).enumerate() {
-            let payload = serde_json::to_value(chunk)?;
-            store
-                .insert_raw_chunk(&rid, wallet, "data_api_trades", i as i32, &payload)
-                .await?;
-            let page_offset = (i * step) as i32;
-            for (j, t) in chunk.iter().enumerate() {
-                let row_payload = serde_json::to_value(t)?;
-                store
-                    .insert_raw_data_api_trade(&rid, wallet, page_offset, j as i32, &row_payload)
-                    .await?;
-            }
-        }
-    }
-
-    let gamma_timing = GammaApiClient::new(http.clone(), rate);
-    let gamma_timing_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
-    let taxonomy_arc = if cfg.ingestion.gamma_taxonomy {
-        Some(GammaTaxonomy::cached(&gamma_timing, cfg.ingestion.gamma_taxonomy_cache_ttl_sec).await)
-    } else {
-        None
-    };
-    let (resolution_ts_by_slug, gamma_resolution_by_slug, gamma_bucket_by_slug) =
-        fetch_gamma_context_for_trades(
-            &gamma_timing,
-            &trades_result.trades,
-            gamma_timing_cap,
-            taxonomy_arc.as_deref(),
-        )
-        .await;
-    let gamma_profile = match gamma_timing.public_profile_by_address(wallet).await {
-        Ok(p) => Some(GammaProfileSummary {
-            display_name: p.name.clone().or_else(|| p.pseudonym.clone()),
-            username: p.pseudonym.clone().or_else(|| p.x_username.clone()),
-            avatar_url: p.profile_image.clone(),
-            created_at: p.created_at.clone(),
-            bio: p.bio.clone(),
-            verified_badge: p.verified_badge,
-            proxy_wallet: p.proxy_wallet.clone(),
-            x_username: p.x_username.clone(),
-        }),
-        Err(e) => {
-            tracing::debug!("gamma public-profile: {e:#}");
-            None
-        }
-    };
 
     let pos_base = if cfg.ingestion.data_api_positions_limit > 0 {
         cfg.ingestion.data_api_positions_limit
@@ -1074,6 +844,39 @@ async fn analyze_wallet(
         }
     }
 
+    let gamma_timing = GammaApiClient::new(http.clone(), rate);
+    let gamma_timing_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
+    let taxonomy_arc = if cfg.ingestion.gamma_taxonomy {
+        Some(GammaTaxonomy::cached(&gamma_timing, cfg.ingestion.gamma_taxonomy_cache_ttl_sec).await)
+    } else {
+        None
+    };
+    let position_slugs = slugs_from_positions(&open_positions, &closed_positions);
+    let (resolution_ts_by_slug, gamma_resolution_by_slug, gamma_bucket_by_slug) =
+        fetch_gamma_context_for_slugs(
+            &gamma_timing,
+            &position_slugs,
+            gamma_timing_cap,
+            taxonomy_arc.as_deref(),
+        )
+        .await;
+    let gamma_profile = match gamma_timing.public_profile_by_address(wallet).await {
+        Ok(p) => Some(GammaProfileSummary {
+            display_name: p.name.clone().or_else(|| p.pseudonym.clone()),
+            username: p.pseudonym.clone().or_else(|| p.x_username.clone()),
+            avatar_url: p.profile_image.clone(),
+            created_at: p.created_at.clone(),
+            bio: p.bio.clone(),
+            verified_badge: p.verified_badge,
+            proxy_wallet: p.proxy_wallet.clone(),
+            x_username: p.x_username.clone(),
+        }),
+        Err(e) => {
+            tracing::debug!("gamma public-profile: {e:#}");
+            None
+        }
+    };
+
     let augment = ReportAugment {
         resolution_ts_by_slug,
         gamma_resolution_by_slug,
@@ -1083,22 +886,15 @@ async fn analyze_wallet(
         gamma_profile,
     };
 
-    let mut slug_by_condition: HashMap<String, String> = HashMap::new();
-    for t in &trades_result.trades {
-        slug_by_condition
-            .entry(normalize_condition_id(&t.condition_id))
-            .or_insert_with(|| t.slug.clone());
-    }
-
     if cfg.canonical.enrich_markets_dim {
         if let Some(store) = storage {
             let gamma = GammaApiClient::new(http.clone(), rate);
             let mut seen: HashSet<String> = HashSet::new();
-            for t in &trades_result.trades {
-                if !seen.insert(t.slug.clone()) {
+            for slug in position_slugs {
+                if !seen.insert(slug.clone()) {
                     continue;
                 }
-                match gamma.market_by_slug(&t.slug).await {
+                match gamma.market_by_slug(&slug).await {
                     Ok(m) => {
                         let end_d = m
                             .end_date
@@ -1111,7 +907,7 @@ async fn analyze_wallet(
                         let raw = serde_json::to_value(&m).unwrap_or_default();
                         if let Err(e) = store
                             .upsert_market_dim(
-                                &t.slug,
+                                &slug,
                                 m.question.as_deref(),
                                 end_d,
                                 closed_d,
@@ -1119,180 +915,28 @@ async fn analyze_wallet(
                             )
                             .await
                         {
-                            tracing::warn!("markets_dim upsert slug={} err={:#}", t.slug, e);
+                            tracing::warn!("markets_dim upsert slug={slug} err={e:#}");
                         }
                     }
-                    Err(e) => tracing::debug!("gamma skip slug={} err={:#}", t.slug, e),
+                    Err(e) => tracing::debug!("gamma skip slug={slug} err={e:#}"),
                 }
             }
         }
     }
 
-    let mut ingest_status = "ok";
-    let mut subgraph_json: Option<serde_json::Value> = None;
-    let mut subgraph_trunc = serde_json::json!({ "fetched": false });
-    let mut maker_rows_mem: Vec<serde_json::Value> = Vec::new();
-    let mut taker_rows_mem: Vec<serde_json::Value> = Vec::new();
-    let mut redemption_rows_mem: Vec<serde_json::Value> = Vec::new();
-    let mut position_rows_mem: Vec<serde_json::Value> = Vec::new();
+    let ingest_status = "ok";
+    let subgraph_trunc = serde_json::json!({
+        "fetched": false,
+        "reason": "not_used",
+    });
 
-    if cfg.subgraph.enabled {
-        let p = subgraph_wallet_params(cfg);
-        match fetch_subgraph_for_wallet(wallet, &p).await {
-            Ok(sub) => {
-                maker_rows_mem = extract_fills_rows(&sub.orderbook_order_filled_events_maker);
-                taker_rows_mem = extract_fills_rows(&sub.orderbook_order_filled_events_taker);
-                redemption_rows_mem = extract_redemption_rows(&sub.activity_redemptions);
-                position_rows_mem = sub
-                    .pnl_user_positions
-                    .get("data")
-                    .and_then(|d| d.get("userPositions"))
-                    .and_then(|x| x.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-
-                subgraph_trunc = serde_json::json!({
-                    "fetched": true,
-                    "activity_redemptions": sub.activity_redemptions.get("_spike_pagination"),
-                    "orderbook_maker": sub.orderbook_order_filled_events_maker.get("_spike_pagination"),
-                    "orderbook_taker": sub.orderbook_order_filled_events_taker.get("_spike_pagination"),
-                    "pnl_user_positions": sub.pnl_user_positions.get("_spike_pagination")
-                        .or_else(|| sub.pnl_user_positions.get("_spike_error")),
-                });
-
-                if let (Some(store), Some(rid)) = (storage, run_id) {
-                    let ps = cfg.subgraph.page_size.max(1) as usize;
-                    let rows = redemption_rows_mem.clone();
-                    persist_json_rows_chunks(store, &rid, wallet, "activity_redemptions", &rows, ps)
-                        .await?;
-                    for r in &rows {
-                        let Some(eid) = r.get("id").and_then(|x| x.as_str()) else {
-                            continue;
-                        };
-                        let ts = r
-                            .get("timestamp")
-                            .and_then(json_value_ts_secs)
-                            .and_then(|s| DateTime::from_timestamp(s, 0));
-                        store
-                            .insert_raw_subgraph_redemption(&rid, wallet, eid, ts, r)
-                            .await?;
-                    }
-                    let m = maker_rows_mem.clone();
-                    persist_json_rows_chunks(store, &rid, wallet, "orderbook_fills_maker", &m, ps)
-                        .await?;
-                    for row in &m {
-                        persist_raw_order_fill_row(store, &rid, wallet, "maker", row).await?;
-                    }
-                    let t = taker_rows_mem.clone();
-                    persist_json_rows_chunks(store, &rid, wallet, "orderbook_fills_taker", &t, ps)
-                        .await?;
-                    for row in &t {
-                        persist_raw_order_fill_row(store, &rid, wallet, "taker", row).await?;
-                    }
-                    for row in &position_rows_mem {
-                        let Some(pid) = row.get("id").and_then(|x| x.as_str()) else {
-                            continue;
-                        };
-                        store
-                            .insert_raw_subgraph_user_position(&rid, wallet, pid, row)
-                            .await?;
-                    }
-                    let pos_ps = cfg.subgraph.positions_page_size.max(1) as usize;
-                    persist_json_rows_chunks(
-                        store,
-                        &rid,
-                        wallet,
-                        "pnl_user_positions",
-                        &position_rows_mem,
-                        pos_ps,
-                    )
-                    .await?;
-                }
-
-                subgraph_json = Some(serde_json::to_value(&sub)?);
-                if sub.partial_failure {
-                    ingest_status = "partial";
-                }
-            }
-            Err(e) => {
-                tracing::warn!("subgraph fetch failed: {e:#}");
-                ingest_status = "partial";
-                subgraph_trunc = serde_json::json!({
-                    "fetched": false,
-                    "error": format!("{e:#}"),
-                });
-                subgraph_json = Some(serde_json::json!({ "_fetch_error": format!("{e:#}") }));
-            }
-        }
-    } else {
-        subgraph_trunc = serde_json::json!({
-            "fetched": false,
-            "reason": "subgraph_disabled",
-        });
-    }
-
-    let should_merge = cfg.analytics.source == "canonical"
-        || cfg.analytics.canonical_shadow
-        || (cfg.canonical.enabled && persist_raw && storage.is_some());
-
-    let merge_opt = if should_merge {
-        let pipe = CanonicalPipelineParams {
-            time_window_sec: cfg.reconciliation.time_window_sec,
-            size_tolerance_pct: cfg.reconciliation.size_tolerance_pct,
-            price_tolerance_abs: cfg.reconciliation.price_tolerance_abs,
-            require_condition_match: cfg.reconciliation.require_condition_match,
-        };
-        Some(build_canonical_merge(
-            wallet,
-            &trades_result.trades,
-            &maker_rows_mem,
-            &taker_rows_mem,
-            &redemption_rows_mem,
-            &position_rows_mem,
-            &slug_by_condition,
-            &pipe,
-            &cfg.reconciliation.rules_version,
-        ))
-    } else {
-        None
-    };
-
-    let owned_synth: Option<Vec<Trade>> = if cfg.analytics.source == "canonical" {
-        merge_opt
-            .as_ref()
-            .map(|artifacts| synthetic_trades_from_events(&artifacts.events, &slug_by_condition))
-    } else {
-        None
-    };
-
-    let trades_for_report: &[Trade] = match &owned_synth {
-        Some(s) if !s.is_empty() => s.as_slice(),
-        _ => {
-            if cfg.analytics.source == "canonical" && merge_opt.is_some() {
-                tracing::warn!(
-                    "analytics.source=canonical produced zero synthetic trades; falling back to data_api trades"
-                );
-            }
-            trades_result.trades.as_slice()
-        }
-    };
-
-    let mut report = build_report(
+    let mut report = build_analyze_report(
         cfg,
         wallet,
-        trades_for_report,
-        trades_result.truncated,
-        trades_result.max_offset_allowed,
+        false,
+        None,
         &augment,
     );
-
-    if trades_result.fetched_incrementally {
-        report.notes.push(format!(
-            "data_api_trades: incremental merge (api_new_rows≈{}, truncated={})",
-            trades_result.incremental_api_delta_count,
-            trades_result.truncated
-        ));
-    }
 
     let mut im = match ingest_meta.clone() {
         Some(m) => m,
@@ -1305,165 +949,26 @@ async fn analyze_wallet(
     };
     im.truncation = Some(IngestionTruncation {
         data_api: DataApiTruncationMeta {
-            truncated: trades_result.truncated,
-            max_offset_allowed: trades_result.max_offset_allowed,
-            trades_received: trades_result.trades.len(),
+            truncated: false,
+            max_offset_allowed: None,
+            trades_received: 0,
         },
         subgraph: subgraph_trunc,
     });
     report.ingestion = Some(im);
 
-    report.subgraph = subgraph_json.clone();
-
+    let analytics_src = "data_api_positions";
     let markets_dim_enriched = cfg.canonical.enrich_markets_dim && storage.is_some();
 
-    let analytics_src = if cfg.analytics.source == "canonical" {
-        "canonical_synthetic_trades"
-    } else {
-        "data_api_trades"
-    };
+    report.data_lineage = Some(DataLineage {
+        analytics_primary_source: analytics_src.to_string(),
+        canonical_merge_applied: false,
+        markets_dim_enriched,
+    });
 
-    let mut merge_persisted = false;
-    if cfg.canonical.enabled {
-        if !persist_raw || storage.is_none() || run_id.is_none() {
-            tracing::warn!(
-                "canonical.enabled requires Postgres + persist_raw + active ingestion run; skipping canonical persist"
-            );
-        } else if let Some(ref artifacts) = merge_opt {
-            let store = storage.expect("storage");
-            let rid = run_id.expect("run_id");
-            if let Err(e) = store.persist_canonical_merge(&rid, wallet, artifacts).await {
-                tracing::warn!("persist_canonical_merge failed: {e:#}");
-                ingest_status = "partial";
-            } else {
-                merge_persisted = true;
-            }
-        }
-    }
-
-    if let Some(ref artifacts) = merge_opt {
-        report.canonical_summary = Some(CanonicalSummary {
-            enabled: true,
-            run_id: run_id.map(|u| u.to_string()).unwrap_or_default(),
-            rules_version: artifacts.report.rules_version.clone(),
-            merged_trade_fills: artifacts.report.counts.matched,
-            data_api_trade_only: artifacts.report.counts.api_only,
-            subgraph_fill_only: artifacts.report.counts.subgraph_fill_only,
-            redemptions: artifacts.report.counts.redemptions,
-            position_snapshots: artifacts.report.counts.position_snapshots,
-            ambiguous_queue_rows: artifacts.report.counts.ambiguous,
-            canonical_events_total: artifacts.report.counts.canonical_total,
-        });
-    }
-
-    if cfg.reconciliation.enabled {
-        if let Some(ref artifacts) = merge_opt {
-            let mut summ = summary_from_v1(
-                &artifacts.report,
-                cfg.reconciliation.time_window_sec,
-            );
-            for n in v1_coverage_alert_notes(
-                &artifacts.report.counts,
-                cfg.reconciliation.api_only_ratio_alert,
-                cfg.reconciliation.api_only_alert_min,
-            ) {
-                summ.note.push('\n');
-                summ.note.push_str(&n);
-            }
-            report.reconciliation_v1 = Some(artifacts.report.clone());
-            report.reconciliation = Some(summ);
-        } else if cfg.subgraph.enabled {
-            if let Some(ref doc) = subgraph_json {
-                if doc.get("_fetch_error").is_some() {
-                    let msg = doc
-                        .get("_fetch_error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
-                    report.reconciliation = Some(subgraph_fetch_failed_summary(
-                        trades_result.trades.len(),
-                        msg,
-                    ));
-                } else {
-                    let m = doc
-                        .get("orderbook_order_filled_events_maker")
-                        .cloned()
-                        .unwrap_or(serde_json::json!({"data":{"orderFilledEvents":[]}}));
-                    let t = doc
-                        .get("orderbook_order_filled_events_taker")
-                        .cloned()
-                        .unwrap_or(serde_json::json!({"data":{"orderFilledEvents":[]}}));
-                    let r = doc
-                        .get("activity_redemptions")
-                        .cloned()
-                        .unwrap_or(serde_json::json!({"data":{"redemptions":[]}}));
-                    report.reconciliation = Some(reconcile_v0(
-                        &trades_result.trades,
-                        &m,
-                        &t,
-                        &r,
-                        cfg.reconciliation.time_window_sec,
-                    ));
-                }
-            }
-        } else {
-            report.reconciliation = Some(ReconciliationSummary {
-                enabled: true,
-                low_confidence: true,
-                note: "Subgraph disabled; enable [subgraph].enabled or pass with_subgraph / ?with_subgraph=true."
-                    .to_string(),
-                ..Default::default()
-            });
-        }
-    }
-
-    if cfg.analytics.canonical_shadow {
-        if let Some(ref artifacts) = merge_opt {
-            let shadow = compute_shadow_metrics(&artifacts.events);
-            let shadow_vol = shadow.total_volume;
-            let note = format!(
-                "shadow trade_like_volume={:.6} vs report.total_volume={:.6} (primary source: {})",
-                shadow_vol,
-                report.total_volume,
-                analytics_src
-            );
-            report.metrics_canonical_shadow = Some(shadow);
-            match &mut report.reconciliation_v1 {
-                Some(v1) => v1.notes.push(note),
-                None => {
-                    let mut v1 = artifacts.report.clone();
-                    v1.notes.push(note);
-                    report.reconciliation_v1 = Some(v1);
-                }
-            }
-            let primary_vol = report.total_volume;
-            apply_shadow_volume_quality_alert(
-                &mut report,
-                &cfg.reconciliation,
-                primary_vol,
-                shadow_vol,
-                analytics_src,
-            );
-        }
-    }
-
-    if merge_opt.is_some() {
-        report.data_lineage = Some(DataLineage {
-            analytics_primary_source: analytics_src.to_string(),
-            canonical_merge_applied: merge_persisted,
-            markets_dim_enriched,
-        });
-    }
-
-    let mut prov_notes: Vec<String> = Vec::new();
-    if trades_result.truncated {
-        prov_notes.push("data_api_historical_truncation".to_string());
-    }
-    if ingest_status != "ok" {
-        prov_notes.push(format!("ingestion_status:{ingest_status}"));
-    }
     report.provenance = Some(ReportProvenance::uniform(
         analytics_src.to_string(),
-        prov_notes.clone(),
+        vec![],
     ));
 
     if let Some(ref mut im) = report.ingestion {
@@ -1476,67 +981,12 @@ async fn analyze_wallet(
 
     if let Some(store) = storage {
         store.upsert_report(&cache_key, wallet, &report).await?;
-        let pnls = trade_pnl::per_trade_realized_pnl(trades_for_report);
-        store
-            .replace_wallet_trade_pnls(&cache_key, wallet, trades_for_report, &pnls)
-            .await?;
         store
             .upsert_leaderboard_row(wallet, &cache_key, &report)
             .await?;
-
-        if cfg.ingestion.persist_wallet_snapshots {
-            let w = wallet.to_lowercase();
-            let snap_meta = WalletPipelineSnapshotMeta {
-                last_ingestion_run_id: run_id.map(|u| u.to_string()),
-                analytics_lane: analytics_src.to_string(),
-                cache_key: cache_key.clone(),
-                schema_version: report.schema_version.clone(),
-                data_api_truncated: trades_result.truncated,
-                data_api_max_offset_allowed: trades_result
-                    .max_offset_allowed
-                    .and_then(|x| i32::try_from(x).ok()),
-                data_api_trade_watermark_ms: trades_for_report
-                    .iter()
-                    .map(|t| trade_timestamp_ms(t.timestamp))
-                    .max(),
-            };
-            let canon_slice = merge_opt.as_ref().map(|m| m.events.as_slice());
-            if let Err(e) = store
-                .replace_wallet_pipeline_snapshots(
-                    &w,
-                    &snap_meta,
-                    trades_for_report,
-                    &pnls,
-                    canon_slice,
-                    &report,
-                )
-                .await
-            {
-                tracing::warn!("replace_wallet_pipeline_snapshots failed: {e:#}");
-            }
-        }
     }
 
     Ok(report)
-}
-
-fn subgraph_wallet_params(cfg: &AppConfig) -> SubgraphWalletParams {
-    SubgraphWalletParams {
-        activity_url: cfg.subgraph.activity_url.clone(),
-        orderbook_url: cfg.subgraph.orderbook_url.clone(),
-        pnl_url: cfg.subgraph.pnl_url.clone(),
-        page_size: cfg.subgraph.page_size,
-        max_pages: cfg.subgraph.max_pages,
-        positions_page_size: cfg.subgraph.positions_page_size,
-        skip_pnl_positions: cfg.subgraph.skip_pnl_positions,
-        cap_rows: (cfg.subgraph.cap_rows_per_stream > 0).then_some(cfg.subgraph.cap_rows_per_stream),
-        timeout: Duration::from_secs(cfg.subgraph.timeout_sec.max(30)),
-        max_retries: cfg.subgraph.max_retries,
-        pnl_max_retries: cfg.subgraph.pnl_max_retries,
-        user_agent: cfg.subgraph.user_agent.clone(),
-        show_progress: cfg.subgraph.show_progress,
-        extended_fill_fields: cfg.subgraph.extended_fill_fields,
-    }
 }
 
 fn parse_gamma_datetime_utc(s: &str) -> Option<DateTime<Utc>> {
@@ -1545,51 +995,444 @@ fn parse_gamma_datetime_utc(s: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-async fn persist_raw_order_fill_row(
-    store: &Storage,
-    run_id: &Uuid,
-    wallet: &str,
-    role: &str,
-    row: &serde_json::Value,
-) -> anyhow::Result<()> {
-    let Some(id) = row.get("id").and_then(|x| x.as_str()) else {
-        return Ok(());
+#[derive(Debug, serde::Deserialize)]
+struct PositionActivityQuery {
+    /// Data API `market` filter: condition id (`0x…`).
+    market: String,
+    /// Skip Postgres read; still writes merged result when DB is configured.
+    #[serde(default)]
+    no_cache: bool,
+}
+
+fn is_valid_polymarket_wallet(s: &str) -> bool {
+    let s = s.trim();
+    let Some(rest) = s.strip_prefix("0x") else {
+        return false;
     };
-    let ts = row
-        .get("timestamp")
-        .and_then(json_value_ts_secs)
-        .and_then(|sec| DateTime::from_timestamp(sec, 0));
-    let cond = row
-        .get("condition")
-        .or_else(|| row.get("conditionId"))
-        .and_then(|x| x.as_str());
-    store
-        .insert_raw_subgraph_order_filled(run_id, wallet, role, id, ts, cond, row)
-        .await
+    rest.len() == 40 && rest.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-async fn persist_json_rows_chunks(
-    storage: &Storage,
-    run_id: &Uuid,
+/// Per-market Data API `/activity` with optional Postgres merge + incremental `start` fetch.
+async fn fetch_position_activity_json(
+    cfg: &AppConfig,
+    storage: Option<&Storage>,
     wallet: &str,
-    source: &str,
-    rows: &[serde_json::Value],
-    chunk_size: usize,
-) -> anyhow::Result<()> {
-    let cs = chunk_size.max(1);
-    if rows.is_empty() {
-        return Ok(());
+    q: &PositionActivityQuery,
+) -> anyhow::Result<serde_json::Value> {
+    use polymarket_account_analyzer::polymarket::data_api::{
+        max_activity_ts_sec, merge_activities_incremental,
+    };
+    let w = wallet.trim().to_lowercase();
+    if !is_valid_polymarket_wallet(&w) {
+        anyhow::bail!("invalid wallet address");
     }
-    for (i, ch) in rows.chunks(cs).enumerate() {
-        let payload = serde_json::to_value(ch)?;
-        storage
-            .insert_raw_chunk(run_id, wallet, source, i as i32, &payload)
+    let market_norm = normalize_condition_id(q.market.trim());
+    if market_norm.is_empty() {
+        anyhow::bail!("market (condition id) is required");
+    }
+
+    let timeout = Duration::from_secs(cfg.timeout_sec.max(10));
+    let http = Client::builder()
+        .user_agent("polymarket-account-analyzer/0.1")
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(15))
+        .no_proxy()
+        .build()?;
+    let data = DataApiClient::new(http, Duration::from_millis(cfg.rate_limit_ms));
+    let page_limit = cfg.trades_page_limit.clamp(1, 500);
+
+    let (merged, incremental_from_cache) = if let Some(store) = storage {
+        if q.no_cache {
+            let full = data
+                .activity_all_for_market(&w, &market_norm, page_limit, None)
+                .await?;
+            let max_t = max_activity_ts_sec(&full);
+            store
+                .upsert_wallet_market_activity_cache(&w, &market_norm, &full, max_t)
+                .await?;
+            (full, false)
+        } else {
+            match store
+                .fetch_wallet_market_activity_cache(&w, &market_norm)
+                .await?
+            {
+                Some((cached, max_ts)) => {
+                    let start_ts = if max_ts > 0 { Some(max_ts + 1) } else { None };
+                    let delta = data
+                        .activity_all_for_market(&w, &market_norm, page_limit, start_ts)
+                        .await?;
+                    let merged = merge_activities_incremental(cached, delta);
+                    let max_t = max_activity_ts_sec(&merged);
+                    store
+                        .upsert_wallet_market_activity_cache(&w, &market_norm, &merged, max_t)
+                        .await?;
+                    (merged, true)
+                }
+                None => {
+                    let full = data
+                        .activity_all_for_market(&w, &market_norm, page_limit, None)
+                        .await?;
+                    let max_t = max_activity_ts_sec(&full);
+                    store
+                        .upsert_wallet_market_activity_cache(&w, &market_norm, &full, max_t)
+                        .await?;
+                    (full, false)
+                }
+            }
+        }
+    } else {
+        let full = data
+            .activity_all_for_market(&w, &market_norm, page_limit, None)
             .await?;
-    }
-    Ok(())
+        (full, false)
+    };
+
+    let max_ts = max_activity_ts_sec(&merged);
+
+    Ok(serde_json::json!({
+        "wallet": w,
+        "market": market_norm,
+        "activity_count": merged.len(),
+        "max_timestamp_sec": max_ts,
+        "incremental_from_cache": incremental_from_cache,
+        "no_cache": q.no_cache,
+        "postgres": storage.is_some(),
+        "activities": merged,
+    }))
 }
 
-fn build_report(
+/// Account-level report from `/positions` + `/closed-positions` + Gamma (no `/trades`).
+fn build_analyze_report(
+    cfg: &AppConfig,
+    wallet: &str,
+    truncated: bool,
+    max_offset_allowed: Option<u32>,
+    augment: &ReportAugment,
+) -> AnalyzeReport {
+    let mut market_keys: HashSet<String> = HashSet::new();
+    for p in &augment.open_positions {
+        let slug = p.slug.as_deref().unwrap_or("").trim();
+        let cid = p.condition_id.as_deref().filter(|s| !s.trim().is_empty());
+        let key = if !slug.is_empty() {
+            slug.to_lowercase()
+        } else if let Some(c) = cid {
+            format!("cid:{}", normalize_condition_id(c))
+        } else {
+            continue;
+        };
+        market_keys.insert(key);
+    }
+    for cp in &augment.closed_positions {
+        let slug = cp.slug.as_deref().unwrap_or("").trim();
+        let cid = cp.condition_id.as_deref().filter(|s| !s.trim().is_empty());
+        let key = if !slug.is_empty() {
+            slug.to_lowercase()
+        } else if let Some(cond) = cid {
+            format!("cid:{}", normalize_condition_id(cond))
+        } else {
+            continue;
+        };
+        market_keys.insert(key);
+    }
+    let distinct_slugs_count = market_keys.len();
+    let row_count = augment.open_positions.len() + augment.closed_positions.len();
+    let fill_denom = row_count.max(1);
+
+    let mut total_volume = 0.0_f64;
+    let mut net_from_positions = 0.0_f64;
+    let mut pnls: Vec<f64> = Vec::new();
+
+    let mut dist: HashMap<String, (usize, f64, f64)> = HashMap::new();
+
+    for p in &augment.open_positions {
+        let sz = p.size.unwrap_or(0.0);
+        let ap = p.avg_price.unwrap_or(0.0);
+        let vol = sz * ap;
+        total_volume += vol;
+        let pnl = p.cash_pnl.unwrap_or(0.0);
+        net_from_positions += pnl;
+        pnls.push(pnl);
+
+        let slug_raw = p.slug.clone().unwrap_or_default();
+        let mt = augment
+            .gamma_bucket_by_slug
+            .get(&slug_raw)
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| cfg.market_type.classify_slug(&slug_raw))
+            .to_string();
+        let e = dist.entry(mt).or_insert((0, 0.0, 0.0));
+        e.0 += 1;
+        e.1 += vol;
+        e.2 += pnl;
+    }
+    for c in &augment.closed_positions {
+        let sz = c.size.unwrap_or(0.0);
+        let ap = c.avg_price.unwrap_or(0.0);
+        let vol = sz * ap;
+        total_volume += vol;
+        let pnl = c.realized_pnl.unwrap_or(0.0);
+        net_from_positions += pnl;
+        pnls.push(pnl);
+
+        let slug_raw = c.slug.clone().unwrap_or_default();
+        let mt = augment
+            .gamma_bucket_by_slug
+            .get(&slug_raw)
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| cfg.market_type.classify_slug(&slug_raw))
+            .to_string();
+        let e = dist.entry(mt).or_insert((0, 0.0, 0.0));
+        e.0 += 1;
+        e.1 += vol;
+        e.2 += pnl;
+    }
+
+    let max_single_win = pnls.iter().cloned().filter(|x| *x > 0.0).fold(0.0_f64, f64::max);
+    let max_single_loss = pnls
+        .iter()
+        .cloned()
+        .filter(|x| *x < 0.0)
+        .fold(0.0_f64, f64::min);
+
+    let mut price_buckets: BTreeMap<String, usize> = BTreeMap::from([
+        ("lt_0_1".to_string(), 0),
+        ("0_1_to_0_3".to_string(), 0),
+        ("0_3_to_0_5".to_string(), 0),
+        ("0_5_to_0_7".to_string(), 0),
+        ("0_7_to_0_9".to_string(), 0),
+        ("gt_0_9".to_string(), 0),
+    ]);
+    for p in &augment.open_positions {
+        let ap = p.avg_price.unwrap_or(0.0);
+        let k = if ap < 0.1 {
+            "lt_0_1"
+        } else if ap < 0.3 {
+            "0_1_to_0_3"
+        } else if ap < 0.5 {
+            "0_3_to_0_5"
+        } else if ap < 0.7 {
+            "0_5_to_0_7"
+        } else if ap < 0.9 {
+            "0_7_to_0_9"
+        } else {
+            "gt_0_9"
+        };
+        *price_buckets.entry(k.to_string()).or_default() += 1;
+    }
+    for c in &augment.closed_positions {
+        let ap = c.avg_price.unwrap_or(0.0);
+        let k = if ap < 0.1 {
+            "lt_0_1"
+        } else if ap < 0.3 {
+            "0_1_to_0_3"
+        } else if ap < 0.5 {
+            "0_3_to_0_5"
+        } else if ap < 0.7 {
+            "0_5_to_0_7"
+        } else if ap < 0.9 {
+            "0_7_to_0_9"
+        } else {
+            "gt_0_9"
+        };
+        *price_buckets.entry(k.to_string()).or_default() += 1;
+    }
+
+    let lifetime_net_pnl = net_from_positions;
+    let total_volume_nonzero = if total_volume == 0.0 { 1.0 } else { total_volume };
+    let mut market_distribution: Vec<MarketDistributionItem> = dist
+        .into_iter()
+        .map(|(market_type, (cnt, vol, pnl))| MarketDistributionItem {
+            market_type,
+            trades: cnt,
+            volume: vol,
+            pnl,
+            trades_pct: (cnt as f64 / fill_denom as f64) * 100.0,
+            volume_pct: (vol / total_volume_nonzero) * 100.0,
+        })
+        .collect();
+    market_distribution.sort_by(|a, b| b.volume.total_cmp(&a.volume));
+    market_distribution.truncate(10);
+
+    let active_hours_utc: BTreeMap<u32, usize> = (0..24u32).map(|h| (h, 0)).collect();
+    let time_analysis = TimeAnalysis {
+        active_hours_utc,
+        entry_to_resolution_seconds: vec![],
+        holding_duration_seconds: vec![],
+        metadata_missing_ratio: 1.0,
+        entry_to_resolution_p50_sec: None,
+        entry_to_resolution_p90_sec: None,
+    };
+
+    let mut closed_wins = 0_usize;
+    let mut closed_n = 0_usize;
+    for c in &augment.closed_positions {
+        if let Some(r) = c.realized_pnl {
+            closed_n += 1;
+            if r > 0.0 {
+                closed_wins += 1;
+            }
+        }
+    }
+    let (win_rate_closed_positions, closed_positions_sample_size) = if closed_n >= 5 {
+        (
+            Some((closed_wins as f64 / closed_n as f64) * 100.0),
+            Some(closed_n),
+        )
+    } else if closed_n > 0 {
+        (None, Some(closed_n))
+    } else {
+        (None, None)
+    };
+
+    let side_bias = SideBias {
+        buy_pct: 50.0,
+        sell_pct: 50.0,
+        yes_pct: 50.0,
+        no_pct: 50.0,
+    };
+    let trading_patterns = TradingPatterns {
+        grid_like_markets: 0,
+        side_bias: side_bias.clone(),
+        win_rate_overall: 0.0,
+        win_rate_by_market_type: vec![],
+        grid_like_market_ratio: Some(0.0),
+        win_rate_closed_positions,
+        closed_positions_sample_size,
+    };
+
+    let no_trades: &[Trade] = &[];
+    let (primary_style, rule_json, pseudocode) = strategy::infer_strategy(StrategyInputs {
+        market_distribution: &market_distribution,
+        patterns: &trading_patterns,
+        side_bias: &trading_patterns.side_bias,
+        total_volume,
+        trades_count: row_count,
+        trades: no_trades,
+        resolution_ts_by_slug: &augment.resolution_ts_by_slug,
+    });
+
+    let strategy_inference = StrategyInference {
+        primary_style: primary_style.clone(),
+        rule_json,
+        pseudocode,
+    };
+
+    let price_buckets_chart = Some(vec![
+        NormalizedPriceBucket {
+            label: "<0.1".into(),
+            range_low: 0.0,
+            range_high: 0.1,
+            count: *price_buckets.get("lt_0_1").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.1–0.3".into(),
+            range_low: 0.1,
+            range_high: 0.3,
+            count: *price_buckets.get("0_1_to_0_3").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.3–0.5".into(),
+            range_low: 0.3,
+            range_high: 0.5,
+            count: *price_buckets.get("0_3_to_0_5").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.5–0.7".into(),
+            range_low: 0.5,
+            range_high: 0.7,
+            count: *price_buckets.get("0_5_to_0_7").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "0.7–0.9".into(),
+            range_low: 0.7,
+            range_high: 0.9,
+            count: *price_buckets.get("0_7_to_0_9").unwrap_or(&0),
+        },
+        NormalizedPriceBucket {
+            label: "≥0.9".into(),
+            range_low: 0.9,
+            range_high: 1.0,
+            count: *price_buckets.get("gt_0_9").unwrap_or(&0),
+        },
+    ]);
+
+    let open_position_value: f64 = augment
+        .open_positions
+        .iter()
+        .filter_map(|p| p.current_value)
+        .sum();
+    let closed_realized_pnl_sum: f64 = augment
+        .closed_positions
+        .iter()
+        .filter_map(|p| p.realized_pnl)
+        .sum();
+    let open_positions_count = augment.open_positions.len();
+
+    AnalyzeReport {
+        schema_version: REPORT_SCHEMA_VERSION.to_string(),
+        analysis_pipeline: Some("account".to_string()),
+        wallet: wallet.to_string(),
+        trades_count: distinct_slugs_count,
+        trades_fill_count: 0,
+        total_volume,
+        data_fetch: DataFetchMeta {
+            truncated,
+            max_offset_allowed,
+        },
+        lifetime: LifetimeMetrics {
+            total_trades: distinct_slugs_count,
+            total_volume,
+            net_pnl: lifetime_net_pnl,
+            net_pnl_settlement: 0.0,
+            open_position_value,
+            max_single_win,
+            max_single_loss,
+            closed_realized_pnl_sum: if augment.closed_positions.is_empty() {
+                None
+            } else {
+                Some(closed_realized_pnl_sum)
+            },
+            open_positions_count: if open_positions_count == 0 {
+                None
+            } else {
+                Some(open_positions_count)
+            },
+        },
+        market_distribution,
+        price_buckets,
+        time_analysis,
+        trading_patterns,
+        strategy_inference,
+        ingestion: None,
+        subgraph: None,
+        reconciliation: None,
+        reconciliation_v1: None,
+        canonical_summary: None,
+        data_lineage: Some(DataLineage {
+            analytics_primary_source: "data_api_positions".to_string(),
+            canonical_merge_applied: false,
+            markets_dim_enriched: false,
+        }),
+        provenance: Some(ReportProvenance::uniform(
+            "data_api_positions",
+            vec!["Account pipeline: metrics from /positions + /closed-positions (+ Gamma); analyze does not paginate /trades. Per-market fills: GET /position-activity/:wallet?market=.".into()],
+        )),
+        metrics_canonical_shadow: None,
+        price_buckets_chart,
+        frontend: None,
+        gamma_profile: augment.gamma_profile.clone(),
+        notes: vec![
+            "Account rollup: from /positions + /closed-positions only (no /trades). lifetime.net_pnl = sum(open cashPnl + closed realizedPnl). net_pnl_settlement=0. Use GET /position-activity/:wallet?market= for per-market /activity.".into(),
+            format!(
+                "trades_count={} distinct markets (slug or condition_id); position rows={}.",
+                distinct_slugs_count, row_count
+            ),
+        ],
+        report_updated_at: Some(Utc::now().to_rfc3339()),
+    }
+}
+
+fn build_report_from_trades(
     cfg: &AppConfig,
     wallet: &str,
     trades: &[Trade],
@@ -1597,7 +1440,6 @@ fn build_report(
     max_offset_allowed: Option<u32>,
     augment: &ReportAugment,
 ) -> AnalyzeReport {
-    let per_trade_pnl = trade_pnl::per_trade_realized_pnl(trades);
     let trade_fills_count = trades.len();
     let distinct_slugs_count = trades
         .iter()
@@ -1612,6 +1454,7 @@ fn build_report(
         .collect::<HashSet<_>>()
         .len();
     let fill_denom = trade_fills_count.max(1);
+    let per_trade_pnl: Vec<f64> = trade_pnl::per_trade_realized_pnl(trades);
     let net_pnl_realized_trades: f64 = per_trade_pnl.iter().sum();
 
     let book = trade_pnl::outcome_book_after_trades(trades);
@@ -1949,6 +1792,7 @@ fn build_report(
 
     AnalyzeReport {
         schema_version: REPORT_SCHEMA_VERSION.to_string(),
+        analysis_pipeline: None,
         wallet: wallet.to_string(),
         trades_count: distinct_slugs_count,
         trades_fill_count: trade_fills_count,
@@ -2207,21 +2051,13 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         }))
     }
 
-    fn is_valid_analyze_wallet_path(s: &str) -> bool {
-        let s = s.trim();
-        let Some(rest) = s.strip_prefix("0x") else {
-            return false;
-        };
-        rest.len() == 40 && rest.chars().all(|c| c.is_ascii_hexdigit())
-    }
-
     /// 浏览器同源拉 Gamma 会 CORS；由 **Rust** 代拉（与 `/analyze` 相同出网路径，无需本机 VPN/HTTPS_PROXY）。
     async fn gamma_public_profile_handler(
         Path(wallet): Path<String>,
         State(st): State<AppState>,
     ) -> impl IntoResponse {
         let w = wallet.trim().to_lowercase();
-        if !is_valid_analyze_wallet_path(&w) {
+        if !is_valid_polymarket_wallet(&w) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "invalid_address" })),
@@ -2265,11 +2101,34 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
         }
     }
 
+    async fn position_activity_handler(
+        Path(wallet): Path<String>,
+        Query(q): Query<PositionActivityQuery>,
+        State(st): State<AppState>,
+    ) -> impl IntoResponse {
+        if q.market.trim().is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "missing market query param" })),
+            )
+                .into_response();
+        }
+        match fetch_position_activity_json(&st.cfg, st.storage.as_ref(), &wallet, &q).await {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("{e:#}") })),
+            )
+                .into_response(),
+        }
+    }
+
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/version", get(version_handler))
         .route("/gamma-public-profile/:wallet", get(gamma_public_profile_handler))
         .route("/analyze/:wallet", get(analyze_handler))
+        .route("/position-activity/:wallet", get(position_activity_handler))
         .route("/leaderboard", get(leaderboard_handler))
         .with_state(state);
 

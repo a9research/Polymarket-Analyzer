@@ -1,5 +1,5 @@
 use crate::canonical::{CanonicalEventInsert, CanonicalMergeArtifacts};
-use crate::polymarket::data_api::{trade_dedup_key, Trade, TradeSide};
+use crate::polymarket::data_api::{trade_dedup_key, Activity, Trade, TradeSide};
 use crate::report::AnalyzeReport;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -149,6 +149,22 @@ impl Storage {
         .execute(&self.pool)
         .await
         .context("create wallet_leaderboard_stats")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS wallet_market_activity_cache (
+                wallet TEXT NOT NULL,
+                market_condition_id TEXT NOT NULL,
+                activities_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                max_event_ts BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (wallet, market_condition_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("create wallet_market_activity_cache")?;
 
         sqlx::query(
             r#"
@@ -981,6 +997,61 @@ impl Storage {
         .execute(&self.pool)
         .await
         .context("upsert wallet_leaderboard_stats")?;
+        Ok(())
+    }
+
+    /// Cached Data API `/activity` rows for `(wallet, market condition_id)` (see `GET /position-activity`).
+    pub async fn fetch_wallet_market_activity_cache(
+        &self,
+        wallet_lc: &str,
+        market_condition_id: &str,
+    ) -> anyhow::Result<Option<(Vec<Activity>, i64)>> {
+        let row = sqlx::query(
+            r#"
+            SELECT activities_json, max_event_ts
+            FROM wallet_market_activity_cache
+            WHERE wallet = $1 AND market_condition_id = $2
+            "#,
+        )
+        .bind(wallet_lc)
+        .bind(market_condition_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetch wallet_market_activity_cache")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let j: serde_json::Value = row.try_get("activities_json")?;
+        let max_ts: i64 = row.try_get("max_event_ts")?;
+        let list: Vec<Activity> = serde_json::from_value(j).unwrap_or_default();
+        Ok(Some((list, max_ts)))
+    }
+
+    pub async fn upsert_wallet_market_activity_cache(
+        &self,
+        wallet_lc: &str,
+        market_condition_id: &str,
+        activities: &[Activity],
+        max_event_ts: i64,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_value(activities).context("serialize activities_json")?;
+        sqlx::query(
+            r#"
+            INSERT INTO wallet_market_activity_cache (wallet, market_condition_id, activities_json, max_event_ts, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (wallet, market_condition_id) DO UPDATE SET
+                activities_json = EXCLUDED.activities_json,
+                max_event_ts = EXCLUDED.max_event_ts,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(wallet_lc)
+        .bind(market_condition_id)
+        .bind(payload)
+        .bind(max_event_ts)
+        .execute(&self.pool)
+        .await
+        .context("upsert wallet_market_activity_cache")?;
         Ok(())
     }
 

@@ -1,31 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// How primary analytics blocks are computed (`build_report` input stream).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnalyticsConfig {
-    /// `data_api` (default) or `canonical` — `canonical` uses merged + DATA_API_TRADE-like events after in-memory merge.
-    #[serde(default = "default_analytics_source")]
-    pub source: String,
-    /// Emit `metrics_canonical_shadow` when canonical merge artifacts are available.
-    #[serde(default = "default_true")]
-    pub canonical_shadow: bool,
-}
-
-fn default_analytics_source() -> String {
-    "data_api".to_string()
-}
-
-impl Default for AnalyticsConfig {
-    fn default() -> Self {
-        Self {
-            source: default_analytics_source(),
-            canonical_shadow: true,
-        }
-    }
-}
-
-/// Canonical merge + `markets_dim` enrichment (requires Postgres + `persist_raw`).
+/// Legacy: canonical merge toggle + Gamma `markets_dim` upsert during analyze (merge path removed from live analyze; `enrich_markets_dim` still used).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalConfig {
     #[serde(default)]
@@ -44,6 +20,7 @@ impl Default for CanonicalConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub rate_limit_ms: u64,
@@ -73,9 +50,6 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub canonical: CanonicalConfig,
-
-    #[serde(default)]
-    pub analytics: AnalyticsConfig,
 
     /// Comma-separated `Origin` values allowed for browser CORS on `serve`, e.g.
     /// `https://stats.example.com,http://localhost:3000`. Empty = no CORS middleware.
@@ -274,25 +248,15 @@ pub struct IngestionConfig {
     /// When `persist_raw`, also write `raw_data_api_open_positions` / `raw_data_api_closed_positions`.
     #[serde(default = "default_true")]
     pub persist_positions_raw: bool,
-    /// Wallet-scoped **latest** pipeline snapshots (normalized trades, optional canonical rows, reconciliation, frontend, strategy, full report) for SQL/BI — see `artifacts/wallet-pipeline-snapshot.md`.
+    /// Wallet-scoped snapshot JSON refresh after cache hits (lightweight).
     #[serde(default = "default_true")]
     pub persist_wallet_snapshots: bool,
-    /// When true and Postgres has `wallet_primary_trade_row` for this wallet, fetch only trades **newer than** the stored watermark (see `data_api::trades_since_watermark`). **false** = always full `/trades` pagination.
-    #[serde(default = "default_true")]
-    pub data_api_incremental_trades: bool,
-    /// Max `/trades` pages per incremental run (page size = `trades_page_limit`).
-    #[serde(default = "default_data_api_incremental_max_pages")]
-    pub data_api_incremental_max_pages: u32,
     /// 拉取 Gamma **`/tags`** + **`/sports`**，在 `max_gamma_slugs_for_timing` 批次内用 `category`/`tags` 归类 `market_distribution`（失败则回退 `[market_type]` slug 规则）。
     #[serde(default = "default_true")]
     pub gamma_taxonomy: bool,
     /// 进程内 taxonomy 缓存 TTL（秒）。**0** = 每次 analyze 全量拉 `/tags`（不推荐）。
     #[serde(default = "default_gamma_taxonomy_cache_ttl_sec")]
     pub gamma_taxonomy_cache_ttl_sec: u64,
-}
-
-fn default_data_api_incremental_max_pages() -> u32 {
-    250
 }
 
 fn default_gamma_taxonomy_cache_ttl_sec() -> u64 {
@@ -307,8 +271,6 @@ impl Default for IngestionConfig {
             data_api_positions_limit: 0,
             persist_positions_raw: true,
             persist_wallet_snapshots: true,
-            data_api_incremental_trades: true,
-            data_api_incremental_max_pages: default_data_api_incremental_max_pages(),
             gamma_taxonomy: true,
             gamma_taxonomy_cache_ttl_sec: default_gamma_taxonomy_cache_ttl_sec(),
         }
@@ -328,7 +290,6 @@ impl Default for AppConfig {
             reconciliation: ReconciliationConfig::default(),
             ingestion: IngestionConfig::default(),
             canonical: CanonicalConfig::default(),
-            analytics: AnalyticsConfig::default(),
             cors_allowed_origins: String::new(),
         }
     }
@@ -536,18 +497,6 @@ pub fn apply_env_overrides(cfg: &mut AppConfig) {
             cfg.ingestion.persist_wallet_snapshots = b;
         }
     }
-    if let Ok(v) = std::env::var("PAA_DATA_API_INCREMENTAL_TRADES") {
-        if let Some(b) = parse_env_bool(&v) {
-            cfg.ingestion.data_api_incremental_trades = b;
-        }
-    }
-    if let Ok(v) = std::env::var("PAA_DATA_API_INCREMENTAL_MAX_PAGES") {
-        if let Ok(n) = v.trim().parse::<u32>() {
-            if n > 0 {
-                cfg.ingestion.data_api_incremental_max_pages = n;
-            }
-        }
-    }
     if let Ok(v) = std::env::var("PAA_GAMMA_TAXONOMY") {
         if let Some(b) = parse_env_bool(&v) {
             cfg.ingestion.gamma_taxonomy = b;
@@ -556,17 +505,6 @@ pub fn apply_env_overrides(cfg: &mut AppConfig) {
     if let Ok(v) = std::env::var("PAA_GAMMA_TAXONOMY_CACHE_TTL_SEC") {
         if let Ok(n) = v.trim().parse::<u64>() {
             cfg.ingestion.gamma_taxonomy_cache_ttl_sec = n;
-        }
-    }
-    if let Ok(v) = std::env::var("PAA_ANALYTICS_SOURCE") {
-        let s = v.trim();
-        if s == "data_api" || s == "canonical" {
-            cfg.analytics.source = s.to_string();
-        }
-    }
-    if let Ok(v) = std::env::var("PAA_ANALYTICS_CANONICAL_SHADOW") {
-        if let Some(b) = parse_env_bool(&v) {
-            cfg.analytics.canonical_shadow = b;
         }
     }
     if let Ok(v) = std::env::var("PAA_ENRICH_MARKETS_DIM") {
@@ -615,7 +553,6 @@ impl Merge for AppConfig {
             reconciliation: other.reconciliation,
             ingestion: other.ingestion,
             canonical: other.canonical,
-            analytics: other.analytics,
             cors_allowed_origins: if other.cors_allowed_origins.is_empty() {
                 self.cors_allowed_origins
             } else {
@@ -625,48 +562,23 @@ impl Merge for AppConfig {
     }
 }
 
-/// Config subset serialized for `report_cache` key (§1.5.5).
+/// Config subset serialized for `report_cache` key (account rollup + Gamma).
 pub fn report_cache_fingerprint_value(cfg: &AppConfig) -> serde_json::Value {
     serde_json::json!({
-        "subgraph": {
-            "enabled": cfg.subgraph.enabled,
-            "cap_rows_per_stream": cfg.subgraph.cap_rows_per_stream,
-            "page_size": cfg.subgraph.page_size,
-            "max_pages": cfg.subgraph.max_pages,
-            "positions_page_size": cfg.subgraph.positions_page_size,
-            "skip_pnl_positions": cfg.subgraph.skip_pnl_positions,
-            "extended_fill_fields": cfg.subgraph.extended_fill_fields,
-        },
+        "analyzer": "account_positions_v2",
+        "trades_page_limit": cfg.trades_page_limit,
+        "market_type": cfg.market_type,
         "canonical": {
-            "enabled": cfg.canonical.enabled,
             "enrich_markets_dim": cfg.canonical.enrich_markets_dim,
         },
-        "reconciliation": {
-            "enabled": cfg.reconciliation.enabled,
-            "time_window_sec": cfg.reconciliation.time_window_sec,
-            "size_tolerance_pct": cfg.reconciliation.size_tolerance_pct,
-            "price_tolerance_abs": cfg.reconciliation.price_tolerance_abs,
-            "require_condition_match": cfg.reconciliation.require_condition_match,
-            "rules_version": cfg.reconciliation.rules_version,
-            "shadow_volume_alert_ratio": cfg.reconciliation.shadow_volume_alert_ratio,
-            "api_only_ratio_alert": cfg.reconciliation.api_only_ratio_alert,
-            "api_only_alert_min": cfg.reconciliation.api_only_alert_min,
-        },
-        "trades_page_limit": cfg.trades_page_limit,
         "ingestion": {
             "persist_raw": cfg.ingestion.persist_raw,
             "max_gamma_slugs_for_timing": cfg.ingestion.max_gamma_slugs_for_timing,
             "data_api_positions_limit": cfg.ingestion.data_api_positions_limit,
             "persist_positions_raw": cfg.ingestion.persist_positions_raw,
             "persist_wallet_snapshots": cfg.ingestion.persist_wallet_snapshots,
-            "data_api_incremental_trades": cfg.ingestion.data_api_incremental_trades,
-            "data_api_incremental_max_pages": cfg.ingestion.data_api_incremental_max_pages,
             "gamma_taxonomy": cfg.ingestion.gamma_taxonomy,
             "gamma_taxonomy_cache_ttl_sec": cfg.ingestion.gamma_taxonomy_cache_ttl_sec,
-        },
-        "analytics": {
-            "source": cfg.analytics.source,
-            "canonical_shadow": cfg.analytics.canonical_shadow,
         },
     })
 }

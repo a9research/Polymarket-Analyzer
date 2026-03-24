@@ -37,14 +37,7 @@ enabled = false
 # subgraph rejects them (e.g. "Cannot query field …" or Goldsky-style "Type `OrderFilledEvent` has no field …").
 # extended_fill_fields = true
 
-# --- Analytics: which trade stream feeds lifetime/distribution/patterns (§1.5) ---
-[analytics]
-# Primary input for metrics: "data_api" (default) or "canonical" (synthetic trades from merged events; falls back if empty).
-source = "data_api"
-# When true (default), run in-memory canonical merge when possible and emit metrics_canonical_shadow + note on reconciliation_v1.
-canonical_shadow = true
-
-# --- Reconciliation: v0 (timestamp-only) when canonical off; v1 params used for canonical merge ---
+# --- Reconciliation: v0/v1 when canonical merge runs (CLI report-from-canonical-run / legacy trades path) ---
 [reconciliation]
 enabled = false
 # time_window_sec = 120
@@ -66,11 +59,8 @@ persist_raw = true
 # data_api_positions_limit = 0
 # persist_raw 时是否写入 raw_data_api_open_positions / raw_data_api_closed_positions
 # persist_positions_raw = true
-# 是否写入 wallet_* 管线快照（规范化主交易行、可选 canonical 行、对账/前端/策略/整份报告）— 见 artifacts/wallet-pipeline-snapshot.md
+# 是否写入 wallet_* 管线快照 — 见 artifacts/wallet-pipeline-snapshot.md（缓存命中时仅轻量刷新）
 # persist_wallet_snapshots = true
-# PG 已有 wallet_primary_trade_row 时对 /trades 按水位增量拉取（依赖 API 新在前排序）
-# data_api_incremental_trades = true
-# data_api_incremental_max_pages = 250
 # Gamma GET /tags + /sports 目录，与 include_tag=true 的 markets/slug 对齐 market_distribution 桶（默认 true）
 # gamma_taxonomy = true
 # gamma_taxonomy_cache_ttl_sec = 3600   # 0 = 每次 analyze 全量拉目录

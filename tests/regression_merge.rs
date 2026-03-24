@@ -71,21 +71,21 @@ fn reconcile_v0_empty_streams() {
 }
 
 #[test]
-fn report_cache_fingerprint_includes_reconciliation_quality() {
+fn report_cache_fingerprint_account_analyzer_shape() {
     let v = report_cache_fingerprint_value(&AppConfig::default());
-    let recon = v.get("reconciliation").expect("reconciliation");
-    assert!(recon.get("shadow_volume_alert_ratio").is_some());
-    assert!(recon.get("api_only_ratio_alert").is_some());
+    assert_eq!(
+        v.get("analyzer").and_then(|x| x.as_str()),
+        Some("account_positions_v2")
+    );
     let ing = v.get("ingestion").expect("ingestion");
     assert!(ing.get("persist_raw").is_some());
     assert!(ing.get("max_gamma_slugs_for_timing").is_some());
     assert!(ing.get("data_api_positions_limit").is_some());
     assert!(ing.get("persist_positions_raw").is_some());
     assert!(ing.get("persist_wallet_snapshots").is_some());
-    assert!(ing.get("data_api_incremental_trades").is_some());
-    assert!(ing.get("data_api_incremental_max_pages").is_some());
     assert!(ing.get("gamma_taxonomy").is_some());
     assert!(ing.get("gamma_taxonomy_cache_ttl_sec").is_some());
+    assert!(v.get("market_type").is_some());
 }
 
 #[test]
