@@ -243,6 +243,8 @@ mod tests {
             closed_time: None,
             closed: Some(true),
             resolved_by: None,
+            category: None,
+            tags: None,
             outcomes: Some(r#"["Yes", "No"]"#.into()),
             outcome_prices: Some(r#"["1", "0"]"#.into()),
             clob_token_ids: Some(

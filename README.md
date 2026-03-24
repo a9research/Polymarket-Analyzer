@@ -226,6 +226,8 @@ cargo run --release -- --config config.toml serve --bind 127.0.0.1:3000
 | **`PAA_PERSIST_WALLET_SNAPSHOTS`** | **`[ingestion].persist_wallet_snapshots`**：是否在每次完整 **`analyze`** 后写入 **`wallet_*`** 表（主交易行、canonical 行、对账/前端/策略/整份报告快照）。 |
 | **`PAA_DATA_API_INCREMENTAL_TRADES`** | **`[ingestion].data_api_incremental_trades`**：是否在 PG 已有 `wallet_primary_trade_row` 时对 `/trades` **按水位增量拉取并合并**（见 `artifacts/wallet-pipeline-snapshot.md`）。 |
 | **`PAA_DATA_API_INCREMENTAL_MAX_PAGES`** | **`[ingestion].data_api_incremental_max_pages`**：增量模式最多翻页数（每页 = `trades_page_limit`）。 |
+| **`PAA_GAMMA_TAXONOMY`** | **`[ingestion].gamma_taxonomy`**：是否用 Gamma **`/tags` + `/sports`** 与 **`markets/slug?include_tag=true`** 驱动 **`market_distribution`** 桶（默认 true；关则只靠 `[market_type]` slug 规则）。 |
+| **`PAA_GAMMA_TAXONOMY_CACHE_TTL_SEC`** | **`[ingestion].gamma_taxonomy_cache_ttl_sec`**：进程内全量目录缓存秒数；**`0`** = 每次 analyze 重新拉 `/tags` 与 `/sports`。 |
 | **`PAA_ANALYTICS_SOURCE`** | **主报告指标**（lifetime、分布、策略反推等）基于哪条「成交流」：**`data_api`** = 直接用 Data API 成交；**`canonical`** = 优先用内存合并后的合成成交（没有则回退 Data API）。 |
 | **`PAA_ANALYTICS_CANONICAL_SHADOW`** | 是否在算主指标的同时**也算一套 canonical 影子指标**（`metrics_canonical_shadow`），用于**对比 Data API 与合并视图**、在报告 notes 里提示差异。 |
 | **`PAA_ENRICH_MARKETS_DIM`** | 是否用 **Gamma** 把市场里出现的 slug **补进 `markets_dim` 维表**（便于后续分析与展示）。需要外网访问 Gamma。 |
@@ -622,9 +624,9 @@ curl -s "http://127.0.0.1:3000/leaderboard?limit=20&period=today" | jq .
 | **`[subgraph]`** | 子图 URL、`enabled`、**分页与封顶**、超时/重试、`extended_fill_fields`、`show_progress`、`user_agent` 等 |
 | **`[reconciliation]`** | `enabled`、v0 时间窗、v1 **`size_tolerance_pct` / `price_tolerance_abs` / `require_condition_match` / `rules_version`**、质量阈值 **`shadow_volume_alert_ratio`、`api_only_ratio_alert`、`api_only_alert_min`** |
 | **`[analytics]`** | **`source`**: `data_api`（默认）或 **`canonical`**（合成成交驱动主指标，空则回退 Data API）；**`canonical_shadow`**：算 shadow 与 `metrics_canonical_shadow` |
-| **`[ingestion]`** | **`persist_raw`**；**`max_gamma_slugs_for_timing`**；**`data_api_positions_limit`**；**`persist_positions_raw`**；**`persist_wallet_snapshots`**；**`data_api_incremental_trades`** / **`data_api_incremental_max_pages`**（**`wallet_*`** 与增量说明见 [`artifacts/wallet-pipeline-snapshot.md`](../artifacts/wallet-pipeline-snapshot.md)） |
+| **`[ingestion]`** | **`persist_raw`**；**`max_gamma_slugs_for_timing`**；**`gamma_taxonomy`** / **`gamma_taxonomy_cache_ttl_sec`**（**`market_distribution`** 与 Gamma `/tags`、`/sports`、`include_tag`）；**`data_api_positions_limit`**；**`persist_positions_raw`**；**`persist_wallet_snapshots`**；**`data_api_incremental_trades`** / **`data_api_incremental_max_pages`**（**`wallet_*`** 与增量说明见 [`artifacts/wallet-pipeline-snapshot.md`](../artifacts/wallet-pipeline-snapshot.md)） |
 | **`[canonical]`** | **`enabled`**：规范合并 + `canonical_events` 等落库；**`enrich_markets_dim`**：Gamma 补市场维表 |
-| **`[market_type]`** | 按 slug 归类市场类型：**规则有序，首条命中生效**；支持 **`contains`** / **`prefix`**（见 `config.rs` / 示例文件） |
+| **`[market_type]`** | **回退**：按 slug 归类（无 Gamma 桶或超出 `max_gamma_slugs_for_timing` 的 slug）；规则有序，首条命中；支持 **`contains`** / **`prefix`**（见 `config.rs` / 示例文件） |
 
 ---
 
@@ -632,7 +634,7 @@ curl -s "http://127.0.0.1:3000/leaderboard?limit=20&period=today" | jq .
 
 启用 Postgres 时，同一钱包的报告可能来自 **`report_cache_kv`**。缓存键由 **钱包（小写）+ 配置指纹哈希** 组成，指纹包含例如：
 
-`trades_page_limit`、`subgraph`（enabled、cap、page_size、max_pages、positions_page_size、skip_pnl、extended_fill_fields）、`canonical`、`reconciliation` 各字段、`ingestion`（含 **`persist_raw`、`max_gamma_slugs_for_timing`、`data_api_positions_limit`、`persist_positions_raw`、`persist_wallet_snapshots`、`data_api_incremental_trades`、`data_api_incremental_max_pages`**）、`analytics` 等。
+`trades_page_limit`、`subgraph`（enabled、cap、page_size、max_pages、positions_page_size、skip_pnl、extended_fill_fields）、`canonical`、`reconciliation` 各字段、`ingestion`（含 **`persist_raw`、`max_gamma_slugs_for_timing`、`gamma_taxonomy`、`gamma_taxonomy_cache_ttl_sec`、`data_api_positions_limit`、`persist_positions_raw`、`persist_wallet_snapshots`、`data_api_incremental_trades`、`data_api_incremental_max_pages`**）、`analytics` 等。
 
 **修改上述任一字段** 后若仍命中旧缓存，请使用 **`--no-cache`** 或 **`?no_cache=true`**。  
 **`--subgraph-cap-rows` / `subgraph_cap_rows`** 会改变 `cap_rows_per_stream`，同样影响指纹。

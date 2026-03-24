@@ -71,6 +71,9 @@ persist_raw = true
 # PG 已有 wallet_primary_trade_row 时对 /trades 按水位增量拉取（依赖 API 新在前排序）
 # data_api_incremental_trades = true
 # data_api_incremental_max_pages = 250
+# Gamma GET /tags + /sports 目录，与 include_tag=true 的 markets/slug 对齐 market_distribution 桶（默认 true）
+# gamma_taxonomy = true
+# gamma_taxonomy_cache_ttl_sec = 3600   # 0 = 每次 analyze 全量拉目录
 
 # --- Canonical merge (Postgres): raw_* row tables, markets_dim, canonical_events, source_event_map, reconciliation_report ---
 [canonical]

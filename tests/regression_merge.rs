@@ -84,6 +84,8 @@ fn report_cache_fingerprint_includes_reconciliation_quality() {
     assert!(ing.get("persist_wallet_snapshots").is_some());
     assert!(ing.get("data_api_incremental_trades").is_some());
     assert!(ing.get("data_api_incremental_max_pages").is_some());
+    assert!(ing.get("gamma_taxonomy").is_some());
+    assert!(ing.get("gamma_taxonomy_cache_ttl_sec").is_some());
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use anyhow::Context;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -19,11 +20,40 @@ impl GammaApiClient {
         }
     }
 
-    pub async fn market_by_slug(&self, slug: &str) -> anyhow::Result<Market> {
-        let url = format!("{}/markets/slug/{}", self.base_url, slug);
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_str()
+    }
+
+    pub async fn get_json<T: DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
         let resp = self
             .http
             .get(url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("gamma GET {url}"))?;
+        tokio::time::sleep(self.rate_limit).await;
+        Ok(resp.json::<T>().await?)
+    }
+
+    pub async fn market_by_slug(&self, slug: &str) -> anyhow::Result<Market> {
+        self.market_by_slug_impl(slug, false).await
+    }
+
+    /// 与 [`Self::market_by_slug`] 相同，但带 **`include_tag=true`**，响应含 `category` / `tags`（Gamma OpenAPI）。
+    pub async fn market_by_slug_include_tags(&self, slug: &str) -> anyhow::Result<Market> {
+        self.market_by_slug_impl(slug, true).await
+    }
+
+    async fn market_by_slug_impl(&self, slug: &str, include_tag: bool) -> anyhow::Result<Market> {
+        let url = format!("{}/markets/slug/{}", self.base_url, slug);
+        let req = self.http.get(url);
+        let req = if include_tag {
+            req.query(&[("include_tag", "true")])
+        } else {
+            req
+        };
+        let resp = req
             .send()
             .await?
             .error_for_status()
@@ -68,6 +98,17 @@ impl GammaApiClient {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GammaTag {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Market {
@@ -80,6 +121,12 @@ pub struct Market {
     pub closed_time: Option<String>,
     pub closed: Option<bool>,
     pub resolved_by: Option<String>,
+    /// Gamma 类目字符串（与官网一致方向；需 `include_tag=true` 时更完整）。
+    #[serde(default)]
+    pub category: Option<String>,
+    /// 需 `GET .../markets/slug/{slug}?include_tag=true`。
+    #[serde(default)]
+    pub tags: Option<Vec<GammaTag>>,
     /// JSON array serialized as string, e.g. `["Yes","No"]`.
     #[serde(default)]
     pub outcomes: Option<String>,

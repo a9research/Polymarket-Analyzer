@@ -13,6 +13,7 @@ use polymarket_account_analyzer::{
             Trade, TradeSide, TradesAllResult, UserPosition,
         },
         gamma_api::GammaApiClient,
+        gamma_taxonomy::GammaTaxonomy,
         subgraph::{fetch_subgraph_for_wallet, SubgraphWalletParams},
     },
     reconciliation::{
@@ -45,6 +46,8 @@ struct ReportAugment {
     resolution_ts_by_slug: HashMap<String, i64>,
     /// Gamma-resolved payout vectors keyed by market `slug` (same cap as resolution times).
     gamma_resolution_by_slug: HashMap<String, GammaResolutionPayouts>,
+    /// `market_distribution` 桶名：Gamma `category` / `tags` + `/tags`·`/sports` 目录（与 `max_gamma_slugs_for_timing` 同批 slug）。
+    gamma_bucket_by_slug: HashMap<String, String>,
     open_positions: Vec<UserPosition>,
     closed_positions: Vec<ClosedPosition>,
     gamma_profile: Option<GammaProfileSummary>,
@@ -196,21 +199,34 @@ async fn fetch_gamma_context_for_trades(
     gamma: &GammaApiClient,
     trades: &[Trade],
     max_slugs: usize,
+    taxonomy: Option<&GammaTaxonomy>,
 ) -> (
     HashMap<String, i64>,
     HashMap<String, GammaResolutionPayouts>,
+    HashMap<String, String>,
 ) {
     if max_slugs == 0 {
-        return (HashMap::new(), HashMap::new());
+        return (HashMap::new(), HashMap::new(), HashMap::new());
     }
     let slugs_set: HashSet<String> = trades.iter().map(|t| t.slug.clone()).collect();
     let mut slugs: Vec<String> = slugs_set.into_iter().collect();
     slugs.sort();
     let mut resolution_ts_by_slug = HashMap::new();
     let mut gamma_resolution_by_slug = HashMap::new();
+    let mut gamma_bucket_by_slug = HashMap::new();
     for slug in slugs.into_iter().take(max_slugs) {
-        match gamma.market_by_slug(&slug).await {
+        let market_res = if taxonomy.is_some() {
+            gamma.market_by_slug_include_tags(&slug).await
+        } else {
+            gamma.market_by_slug(&slug).await
+        };
+        match market_res {
             Ok(m) => {
+                if let Some(tax) = taxonomy {
+                    if let Some(bucket) = tax.bucket_for_market(&m) {
+                        gamma_bucket_by_slug.insert(slug.clone(), bucket);
+                    }
+                }
                 let ts = m
                     .closed_time
                     .as_deref()
@@ -226,7 +242,11 @@ async fn fetch_gamma_context_for_trades(
             Err(e) => tracing::debug!("gamma context skip slug={slug} err={e:#}"),
         }
     }
-    (resolution_ts_by_slug, gamma_resolution_by_slug)
+    (
+        resolution_ts_by_slug,
+        gamma_resolution_by_slug,
+        gamma_bucket_by_slug,
+    )
 }
 
 fn build_frontend_presentation(
@@ -986,12 +1006,19 @@ async fn analyze_wallet(
 
     let gamma_timing = GammaApiClient::new(http.clone(), rate);
     let gamma_timing_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
-    let (resolution_ts_by_slug, gamma_resolution_by_slug) = fetch_gamma_context_for_trades(
-        &gamma_timing,
-        &trades_result.trades,
-        gamma_timing_cap,
-    )
-    .await;
+    let taxonomy_arc = if cfg.ingestion.gamma_taxonomy {
+        Some(GammaTaxonomy::cached(&gamma_timing, cfg.ingestion.gamma_taxonomy_cache_ttl_sec).await)
+    } else {
+        None
+    };
+    let (resolution_ts_by_slug, gamma_resolution_by_slug, gamma_bucket_by_slug) =
+        fetch_gamma_context_for_trades(
+            &gamma_timing,
+            &trades_result.trades,
+            gamma_timing_cap,
+            taxonomy_arc.as_deref(),
+        )
+        .await;
     let gamma_profile = match gamma_timing.public_profile_by_address(wallet).await {
         Ok(p) => Some(GammaProfileSummary {
             display_name: p.name.clone().or_else(|| p.pseudonym.clone()),
@@ -1050,6 +1077,7 @@ async fn analyze_wallet(
     let augment = ReportAugment {
         resolution_ts_by_slug,
         gamma_resolution_by_slug,
+        gamma_bucket_by_slug,
         open_positions,
         closed_positions,
         gamma_profile,
@@ -1688,7 +1716,12 @@ fn build_report(
         };
         *price_buckets.entry(bucket_key.to_string()).or_default() += 1;
 
-        let market_type = cfg.market_type.classify_slug(&t.slug).to_string();
+        let market_type = augment
+            .gamma_bucket_by_slug
+            .get(&t.slug)
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| cfg.market_type.classify_slug(&t.slug))
+            .to_string();
         let entry = dist.entry(market_type.clone()).or_insert((0, 0.0, 0.0));
         entry.0 += 1;
         entry.1 += volume;
@@ -1990,6 +2023,9 @@ fn build_report(
             );
             notes.push(
                 "frontend.trade_ledger_integrity (2.5.4+): row counts + sum(pnl) prove paired view is a BUY-filter of full ledger; no fills removed from trade_ledger.".into(),
+            );
+            notes.push(
+                "market_distribution (2.5.5+): primary bucket from Gamma GET /markets/slug?include_tag=true (category + tags) with /tags + /sports id→label/sport maps; slug [market_type] rules are fallback only. Slugs beyond max_gamma_slugs_for_timing fall back to slug rules.".into(),
             );
             notes
         },

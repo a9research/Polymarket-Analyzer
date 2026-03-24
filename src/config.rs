@@ -283,10 +283,20 @@ pub struct IngestionConfig {
     /// Max `/trades` pages per incremental run (page size = `trades_page_limit`).
     #[serde(default = "default_data_api_incremental_max_pages")]
     pub data_api_incremental_max_pages: u32,
+    /// 拉取 Gamma **`/tags`** + **`/sports`**，在 `max_gamma_slugs_for_timing` 批次内用 `category`/`tags` 归类 `market_distribution`（失败则回退 `[market_type]` slug 规则）。
+    #[serde(default = "default_true")]
+    pub gamma_taxonomy: bool,
+    /// 进程内 taxonomy 缓存 TTL（秒）。**0** = 每次 analyze 全量拉 `/tags`（不推荐）。
+    #[serde(default = "default_gamma_taxonomy_cache_ttl_sec")]
+    pub gamma_taxonomy_cache_ttl_sec: u64,
 }
 
 fn default_data_api_incremental_max_pages() -> u32 {
     250
+}
+
+fn default_gamma_taxonomy_cache_ttl_sec() -> u64 {
+    3600
 }
 
 impl Default for IngestionConfig {
@@ -299,6 +309,8 @@ impl Default for IngestionConfig {
             persist_wallet_snapshots: true,
             data_api_incremental_trades: true,
             data_api_incremental_max_pages: default_data_api_incremental_max_pages(),
+            gamma_taxonomy: true,
+            gamma_taxonomy_cache_ttl_sec: default_gamma_taxonomy_cache_ttl_sec(),
         }
     }
 }
@@ -332,27 +344,11 @@ pub struct MarketTypeConfig {
     pub rules: Vec<MarketTypeRule>,
 }
 
-fn default_market_type_sports_prefixes() -> Vec<MarketTypeRule> {
-    // Common Polymarket slug prefixes (football / US sports); prefix rules run before substring rules.
-    const PREFIXES: &[&str] = &[
-        "epl-", "ucl-", "uel-", "fl1-", "mls-", "bun-", "cdr-", "elc-", "ere-", "ita-", "por-",
-        "spl-", "spfl-", "sea-", "lig-", "j1-", "j2-", "k1-", "csl-", "ered-", "ligue-", "prem-",
-        "nfl-", "nba-", "nhl-", "mlb-", "ncaa-", "wnba-", "atp-", "wta-", "ufc-", "mma-",
-        "fif-", "afc-", "caf-", "con-", "uef-", "lib-", "cwc-", "copa-", "euro-", "eth-", "brz-",
-    ];
-    PREFIXES
-        .iter()
-        .map(|p| MarketTypeRule::Prefix {
-            prefix: (*p).to_string(),
-            r#type: "sports".to_string(),
-        })
-        .collect()
-}
-
 impl Default for MarketTypeConfig {
     fn default() -> Self {
-        let mut rules = default_market_type_sports_prefixes();
-        rules.extend([
+        // 体育等大类默认由 Gamma `/tags` + `/sports` + `markets/slug?include_tag=` 驱动（见 `ingestion.gamma_taxonomy`）。
+        // 此处仅保留 **slug 文本回退**（Gamma 未命中或超出 slug 上限时）。
+        let rules = vec![
             MarketTypeRule::Contains {
                 contains: "5-min".to_string(),
                 r#type: "5-min".to_string(),
@@ -377,7 +373,7 @@ impl Default for MarketTypeConfig {
                 contains: "crypto".to_string(),
                 r#type: "crypto".to_string(),
             },
-        ]);
+        ];
         Self {
             default_type: "unknown".to_string(),
             rules,
@@ -552,6 +548,16 @@ pub fn apply_env_overrides(cfg: &mut AppConfig) {
             }
         }
     }
+    if let Ok(v) = std::env::var("PAA_GAMMA_TAXONOMY") {
+        if let Some(b) = parse_env_bool(&v) {
+            cfg.ingestion.gamma_taxonomy = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PAA_GAMMA_TAXONOMY_CACHE_TTL_SEC") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            cfg.ingestion.gamma_taxonomy_cache_ttl_sec = n;
+        }
+    }
     if let Ok(v) = std::env::var("PAA_ANALYTICS_SOURCE") {
         let s = v.trim();
         if s == "data_api" || s == "canonical" {
@@ -655,6 +661,8 @@ pub fn report_cache_fingerprint_value(cfg: &AppConfig) -> serde_json::Value {
             "persist_wallet_snapshots": cfg.ingestion.persist_wallet_snapshots,
             "data_api_incremental_trades": cfg.ingestion.data_api_incremental_trades,
             "data_api_incremental_max_pages": cfg.ingestion.data_api_incremental_max_pages,
+            "gamma_taxonomy": cfg.ingestion.gamma_taxonomy,
+            "gamma_taxonomy_cache_ttl_sec": cfg.ingestion.gamma_taxonomy_cache_ttl_sec,
         },
         "analytics": {
             "source": cfg.analytics.source,
