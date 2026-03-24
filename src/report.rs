@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// 新算报告根字段 `schema_version`；与 README / 前端说明对齐，变更时同步 bump。
-pub const REPORT_SCHEMA_VERSION: &str = "2.7.0";
+pub const REPORT_SCHEMA_VERSION: &str = "2.7.1";
 
 fn default_schema_version() -> String {
     // Legacy cached reports without this field deserialize as 1.0.0; new runs set 2.0.0 in `build_report`.
@@ -159,6 +159,33 @@ pub struct PositionRowDisplay {
     pub cur_price: Option<f64>,
     pub cash_pnl: Option<f64>,
     pub current_value: Option<f64>,
+    /// Polymarket condition id (`0x…`); for `/position-activity?market=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_id: Option<String>,
+}
+
+/// Open + closed markets for UI drill-down (`GET /position-activity/:wallet?market=`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionMarketPick {
+    pub condition_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// `open` | `closed`
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cash_pnl: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realized_pnl: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_value: Option<f64>,
 }
 
 /// 逐笔台账：Data API 每条成交一行 + 已结算持仓的 **SETTLEMENT** 合成行（买入/卖出或清算价与名义、盈亏）。
@@ -204,6 +231,8 @@ pub struct FrontendPresentation {
     pub biggest_losses: Vec<TradeHighlight>,
     pub recent_trades: Vec<TradeHighlight>,
     pub current_positions: Vec<PositionRowDisplay>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub position_markets: Vec<PositionMarketPick>,
     /// 时间序：成交 + 结算行；可与 `lifetime.net_pnl` 逐项对照。
     #[serde(default)]
     pub trade_ledger: Vec<TradeLedgerRow>,

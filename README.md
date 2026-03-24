@@ -123,6 +123,9 @@ cargo run --release -- analyze 0x5924ca480d8b08cd5f3e5811fa378c4082475af6 --out 
 # 跳过 Postgres 报告缓存
 cargo run --release -- analyze 0x5924ca480d8b08cd5f3e5811fa378c4082475af6 --no-cache
 
+# 仅 Data API /positions + /closed-positions，不请求 Gamma（与全量报告分键缓存）
+cargo run --release -- analyze 0x5924ca480d8b08cd5f3e5811fa378c4082475af6 --no-gamma --out report-fast.json
+
 # 子图 + 对账 + 规范层落库（需 DATABASE_URL，且建议 config.toml 中 persist_raw）
 cargo run --release -- analyze 0x5924ca480d8b08cd5f3e5811fa378c4082475af6 \
   --with-subgraph --with-reconciliation --with-canonical --out report.json
@@ -393,7 +396,7 @@ api.forevex.trade {
    `curl -v --max-time 5 http://127.0.0.1:3000/health`  
    应返回 **`ok`**。若本机都失败，说明服务没起来或端口不是 3000。
 3b. **确认二进制报告 schema**（与「同步了代码但 `analyze` 仍返回旧 `schema_version`」排查）：  
-   `curl -sS http://127.0.0.1:3000/version` → JSON 里的 **`report_schema_version`** 应为当前发布（如 **`2.7.0`**）。若明显落后，说明**跑的还是旧镜像/旧二进制**（需 **`docker compose build --no-cache`** 或重新发布产物），而非仅「刷新了页面」。
+   `curl -sS http://127.0.0.1:3000/version` → JSON 里的 **`report_schema_version`** 应为当前发布（如 **`2.7.1`**）。若明显落后，说明**跑的还是旧镜像/旧二进制**（需 **`docker compose build --no-cache`** 或重新发布产物），而非仅「刷新了页面」。
 4. **`/analyze` 可能很慢**：会从 Polymarket Data API 等拉数据，**几分钟都正常**；`curl` **要等整份 JSON 响应结束**才会把 body 给你，期间终端可能**长时间没有输出**。请加大超时，例如：  
    `curl -v --max-time 600 "http://127.0.0.1:3000/analyze/0x你的地址" | head -c 500`
 5. **从你电脑访问 `http://54.x.x.x:3000` 一直卡住**：检查云厂商 **安全组入站**、Linux **`sudo ufw status`**，是否放行 **TCP 3000**；可用 `curl -v --max-time 10 http://54.x.x.x:3000/health` 先测（部署了新版本才有 `/health`，旧镜像需 `docker compose up --build -d` 重建）。
@@ -573,6 +576,7 @@ cargo run --release -- report-from-canonical-run "550e8400-..." --out replay.jso
 | 参数 | 说明 |
 |------|------|
 | `no_cache` | 跳过报告缓存 |
+| `no_gamma` | **跳过全部 Gamma HTTP**（公开 profile、按 slug 上下文、taxonomy 预热、`markets_dim` upsert）；仅 Data API **`/positions` + `/closed-positions`**；与全量报告使用**不同**缓存键；**`cached_only`** 须带相同 `no_gamma` 才能命中 |
 | `cached_only` | **仅**读 Postgres 报告缓存；命中返回 200 JSON，未命中 **204 No Content**（无 body，避免浏览器把正常 miss 记成 404）；未配置存储时仍为 **404** `{"error":"cache_miss"}`；与 `no_cache` 互斥。布尔查询请写 **`cached_only=true`**（不要用 `=1`，Axum 会 400） |
 | `with_subgraph` / `no_subgraph` | 子图开关 |
 | `subgraph_cap_rows` | 子图每流行数上限（整数，同 CLI） |
@@ -583,6 +587,7 @@ cargo run --release -- report-from-canonical-run "550e8400-..." --out replay.jso
 ```bash
 curl -s "http://127.0.0.1:3000/analyze/0x5924ca480d8b08cd5f3e5811fa378c4082475af6" | jq .
 curl -s "http://127.0.0.1:3000/analyze/0x...?no_cache=true" | jq .
+curl -s "http://127.0.0.1:3000/analyze/0x...?no_gamma=true" | jq .
 curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&with_reconciliation=true" | jq .
 curl -s "http://127.0.0.1:3000/analyze/0x...?with_subgraph=true&subgraph_cap_rows=500" | jq .
 curl -s "http://127.0.0.1:3000/leaderboard?limit=20" | jq .
@@ -626,7 +631,7 @@ curl -s "http://127.0.0.1:3000/leaderboard?limit=20&period=today" | jq .
 
 启用 Postgres 时，同一钱包的报告可能来自 **`report_cache_kv`**。缓存键由 **钱包（小写）+ 配置指纹哈希** 组成，指纹包含例如：
 
-固定指纹 **`analyzer: account_positions_v2`** + **`market_type`** + **`canonical.enrich_markets_dim`** + **`ingestion`**（**`persist_raw`、`max_gamma_slugs_for_timing`、`data_api_positions_limit`、`persist_positions_raw`、`persist_wallet_snapshots`、`gamma_taxonomy`、`gamma_taxonomy_cache_ttl_sec`**）+ **`trades_page_limit`**。
+固定指纹 **`analyzer: account_positions_v2`** + **`analyze_no_gamma`**（`?no_gamma=true` 时为 true）+ **`market_type`** + **`canonical.enrich_markets_dim`** + **`ingestion`**（**`persist_raw`、`max_gamma_slugs_for_timing`、`data_api_positions_limit`、`persist_positions_raw`、`persist_wallet_snapshots`、`gamma_taxonomy`、`gamma_taxonomy_cache_ttl_sec`**）+ **`trades_page_limit`**。
 
 **修改上述任一字段** 后若仍命中旧缓存，请使用 **`--no-cache`** 或 **`?no_cache=true`**。  
 **`--subgraph-cap-rows` / `subgraph_cap_rows`** 会改变 `cap_rows_per_stream`，同样影响指纹。
@@ -659,7 +664,7 @@ RUST_LOG=polymarket_account_analyzer=debug cargo run --release -- serve --bind 1
 
 ## 报告 JSON（schema 2.x）
 
-当前 **`analyze`** 默认输出 **`schema_version: "2.7.0"`**（账户管线）：**`analysis_pipeline: "account"`**，**`trades_fill_count: 0`**，通常**无** `frontend.trade_ledger`（逐笔成交请用 **`GET /position-activity/:wallet?market=`**）。历史 PG 缓存或 **`report-from-canonical-run`** 仍可能返回更早 schema。较旧版本变更摘要：**2.5.4** `trade_ledger_integrity`；**2.5.2** `trade_ledger`；**2.5** `net_pnl_settlement`。
+当前 **`analyze`** 默认输出 **`schema_version: "2.7.1"`**（账户汇总）：**`analysis_pipeline: "account"`**，**`trades_fill_count: 0`**；**`frontend.position_markets`** 列出可深入的市场（condition id）；**`GET /position-activity/:wallet?market=`** 拉该市场 **`/activity`**。历史 PG 缓存或 **`report-from-canonical-run`** 仍可能返回更早 schema。较旧版本变更摘要：**2.5.4** `trade_ledger_integrity`；**2.5.2** `trade_ledger`；**2.5** `net_pnl_settlement`。
 
 | 块 | 说明 |
 |----|------|

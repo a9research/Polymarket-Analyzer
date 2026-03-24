@@ -72,10 +72,14 @@ fn reconcile_v0_empty_streams() {
 
 #[test]
 fn report_cache_fingerprint_account_analyzer_shape() {
-    let v = report_cache_fingerprint_value(&AppConfig::default());
+    let v = report_cache_fingerprint_value(&AppConfig::default(), false);
     assert_eq!(
         v.get("analyzer").and_then(|x| x.as_str()),
         Some("account_positions_v2")
+    );
+    assert_eq!(
+        v.get("analyze_no_gamma").and_then(|x| x.as_bool()),
+        Some(false)
     );
     let ing = v.get("ingestion").expect("ingestion");
     assert!(ing.get("persist_raw").is_some());

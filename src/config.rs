@@ -563,9 +563,11 @@ impl Merge for AppConfig {
 }
 
 /// Config subset serialized for `report_cache` key (account rollup + Gamma).
-pub fn report_cache_fingerprint_value(cfg: &AppConfig) -> serde_json::Value {
+/// `analyze_no_gamma`: HTTP `?no_gamma=true` — no Gamma HTTP at all; must differ from full reports in cache.
+pub fn report_cache_fingerprint_value(cfg: &AppConfig, analyze_no_gamma: bool) -> serde_json::Value {
     serde_json::json!({
         "analyzer": "account_positions_v2",
+        "analyze_no_gamma": analyze_no_gamma,
         "trades_page_limit": cfg.trades_page_limit,
         "market_type": cfg.market_type,
         "canonical": {
@@ -584,9 +586,10 @@ pub fn report_cache_fingerprint_value(cfg: &AppConfig) -> serde_json::Value {
 }
 
 /// Stable cache key: `wallet_lower` + SHA256 prefix of fingerprint JSON.
-pub fn report_cache_key(wallet: &str, cfg: &AppConfig) -> String {
+pub fn report_cache_key(wallet: &str, cfg: &AppConfig, analyze_no_gamma: bool) -> String {
     let w = wallet.trim().to_lowercase();
-    let body = serde_json::to_string(&report_cache_fingerprint_value(cfg)).unwrap_or_default();
+    let body =
+        serde_json::to_string(&report_cache_fingerprint_value(cfg, analyze_no_gamma)).unwrap_or_default();
     let mut h = Sha256::new();
     h.update(body.as_bytes());
     let hex = format!("{:x}", h.finalize());

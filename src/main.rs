@@ -19,8 +19,9 @@ use polymarket_account_analyzer::{
     report::{
         AnalyzeReport, CanonicalSummary, DataApiTruncationMeta, DataFetchMeta, DataLineage,
         FrontendPresentation, GammaProfileSummary, IngestionMeta, IngestionTruncation,
-        LifetimeMetrics, MarketDistributionItem, NormalizedPriceBucket, PositionRowDisplay,
-        ReportProvenance, REPORT_SCHEMA_VERSION, SideBias, StrategyInference, TimeAnalysis,
+        LifetimeMetrics, MarketDistributionItem, NormalizedPriceBucket, PositionMarketPick,
+        PositionRowDisplay, ReportProvenance, REPORT_SCHEMA_VERSION, SideBias, StrategyInference,
+        TimeAnalysis,
         TradeHighlight, TradeLedgerIntegrity, TradeLedgerRow, TradingPatterns,
         WinRateByMarketType,
     },
@@ -333,6 +334,11 @@ fn build_frontend_presentation(
             cur_price: p.cur_price,
             cash_pnl: p.cash_pnl,
             current_value: p.current_value,
+            condition_id: p
+                .condition_id
+                .as_deref()
+                .map(normalize_condition_id)
+                .filter(|s| !s.is_empty()),
         })
         .collect();
 
@@ -350,6 +356,7 @@ fn build_frontend_presentation(
         biggest_losses: losses,
         recent_trades: recent,
         current_positions,
+        position_markets: vec![],
         trade_ledger,
         trade_ledger_paired,
         trade_ledger_integrity,
@@ -411,6 +418,9 @@ struct AnalyzeCliFlags {
     /// Skip writing raw chunks to Postgres for this run.
     #[arg(long, default_value_t = false)]
     no_persist_raw: bool,
+    /// Skip all Gamma HTTP (public profile, per-slug timing/taxonomy, markets_dim upserts). Data API positions only.
+    #[arg(long, default_value_t = false)]
+    no_gamma: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -435,6 +445,9 @@ struct AnalyzeQuery {
     cached_only: bool,
     #[serde(default)]
     no_persist_raw: bool,
+    /// Skip all Gamma HTTP; separate cache key from full reports.
+    #[serde(default)]
+    no_gamma: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -528,7 +541,14 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let cfg = effective_config(&cfg, &AnalyzeOverrides::from(&flags));
             let storage = init_storage(&cfg).await?;
-            let report = analyze_wallet(&cfg, storage.as_ref(), &wallet, no_cache).await?;
+            let report = analyze_wallet(
+                &cfg,
+                storage.as_ref(),
+                &wallet,
+                no_cache,
+                flags.no_gamma,
+            )
+            .await?;
             write_json_output(&report, out.as_ref())?;
         }
         Command::Serve { bind } => {
@@ -703,7 +723,7 @@ async fn report_from_canonical_pg_run(
     });
 
     if write_cache {
-        let cache_key = report_cache_key(&wallet, cfg);
+        let cache_key = report_cache_key(&wallet, cfg, false);
         let pnls = trade_pnl::per_trade_realized_pnl(&synth);
         store.upsert_report(&cache_key, &wallet, &report).await?;
         store
@@ -741,8 +761,9 @@ async fn analyze_wallet(
     storage: Option<&Storage>,
     wallet: &str,
     no_cache: bool,
+    no_gamma: bool,
 ) -> anyhow::Result<AnalyzeReport> {
-    let cache_key = report_cache_key(wallet, cfg);
+    let cache_key = report_cache_key(wallet, cfg, no_gamma);
     let w = wallet.to_lowercase();
 
     if !no_cache {
@@ -844,38 +865,57 @@ async fn analyze_wallet(
         }
     }
 
-    let gamma_timing = GammaApiClient::new(http.clone(), rate);
-    let gamma_timing_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
-    let taxonomy_arc = if cfg.ingestion.gamma_taxonomy {
-        Some(GammaTaxonomy::cached(&gamma_timing, cfg.ingestion.gamma_taxonomy_cache_ttl_sec).await)
-    } else {
-        None
-    };
     let position_slugs = slugs_from_positions(&open_positions, &closed_positions);
-    let (resolution_ts_by_slug, gamma_resolution_by_slug, gamma_bucket_by_slug) =
-        fetch_gamma_context_for_slugs(
-            &gamma_timing,
-            &position_slugs,
-            gamma_timing_cap,
-            taxonomy_arc.as_deref(),
-        )
-        .await;
-    let gamma_profile = match gamma_timing.public_profile_by_address(wallet).await {
-        Ok(p) => Some(GammaProfileSummary {
-            display_name: p.name.clone().or_else(|| p.pseudonym.clone()),
-            username: p.pseudonym.clone().or_else(|| p.x_username.clone()),
-            avatar_url: p.profile_image.clone(),
-            created_at: p.created_at.clone(),
-            bio: p.bio.clone(),
-            verified_badge: p.verified_badge,
-            proxy_wallet: p.proxy_wallet.clone(),
-            x_username: p.x_username.clone(),
-        }),
-        Err(e) => {
-            tracing::debug!("gamma public-profile: {e:#}");
-            None
-        }
-    };
+    let (resolution_ts_by_slug, gamma_resolution_by_slug, gamma_bucket_by_slug, gamma_profile) =
+        if no_gamma {
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+            )
+        } else {
+            let gamma_timing = GammaApiClient::new(http.clone(), rate);
+            let gamma_timing_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
+            let taxonomy_arc = if cfg.ingestion.gamma_taxonomy {
+                Some(
+                    GammaTaxonomy::cached(&gamma_timing, cfg.ingestion.gamma_taxonomy_cache_ttl_sec)
+                        .await,
+                )
+            } else {
+                None
+            };
+            let (resolution_ts_by_slug, gamma_resolution_by_slug, gamma_bucket_by_slug) =
+                fetch_gamma_context_for_slugs(
+                    &gamma_timing,
+                    &position_slugs,
+                    gamma_timing_cap,
+                    taxonomy_arc.as_deref(),
+                )
+                .await;
+            let gamma_profile = match gamma_timing.public_profile_by_address(wallet).await {
+                Ok(p) => Some(GammaProfileSummary {
+                    display_name: p.name.clone().or_else(|| p.pseudonym.clone()),
+                    username: p.pseudonym.clone().or_else(|| p.x_username.clone()),
+                    avatar_url: p.profile_image.clone(),
+                    created_at: p.created_at.clone(),
+                    bio: p.bio.clone(),
+                    verified_badge: p.verified_badge,
+                    proxy_wallet: p.proxy_wallet.clone(),
+                    x_username: p.x_username.clone(),
+                }),
+                Err(e) => {
+                    tracing::debug!("gamma public-profile: {e:#}");
+                    None
+                }
+            };
+            (
+                resolution_ts_by_slug,
+                gamma_resolution_by_slug,
+                gamma_bucket_by_slug,
+                gamma_profile,
+            )
+        };
 
     let augment = ReportAugment {
         resolution_ts_by_slug,
@@ -886,15 +926,13 @@ async fn analyze_wallet(
         gamma_profile,
     };
 
-    if cfg.canonical.enrich_markets_dim {
+    // Same cap as `fetch_gamma_context_for_slugs`: avoid unbounded sequential Gamma calls for whales.
+    let markets_dim_cap = cfg.ingestion.max_gamma_slugs_for_timing as usize;
+    if !no_gamma && cfg.canonical.enrich_markets_dim && markets_dim_cap > 0 {
         if let Some(store) = storage {
             let gamma = GammaApiClient::new(http.clone(), rate);
-            let mut seen: HashSet<String> = HashSet::new();
-            for slug in position_slugs {
-                if !seen.insert(slug.clone()) {
-                    continue;
-                }
-                match gamma.market_by_slug(&slug).await {
+            for slug in position_slugs.iter().take(markets_dim_cap) {
+                match gamma.market_by_slug(slug).await {
                     Ok(m) => {
                         let end_d = m
                             .end_date
@@ -907,7 +945,7 @@ async fn analyze_wallet(
                         let raw = serde_json::to_value(&m).unwrap_or_default();
                         if let Err(e) = store
                             .upsert_market_dim(
-                                &slug,
+                                slug,
                                 m.question.as_deref(),
                                 end_d,
                                 closed_d,
@@ -937,6 +975,12 @@ async fn analyze_wallet(
         None,
         &augment,
     );
+    if no_gamma {
+        report.notes.push(
+            "no_gamma: skipped Gamma API (public profile, per-slug context, taxonomy, markets_dim upserts)."
+                .into(),
+        );
+    }
 
     let mut im = match ingest_meta.clone() {
         Some(m) => m,
@@ -958,7 +1002,8 @@ async fn analyze_wallet(
     report.ingestion = Some(im);
 
     let analytics_src = "data_api_positions";
-    let markets_dim_enriched = cfg.canonical.enrich_markets_dim && storage.is_some();
+    let markets_dim_enriched =
+        !no_gamma && cfg.canonical.enrich_markets_dim && storage.is_some();
 
     report.data_lineage = Some(DataLineage {
         analytics_primary_source: analytics_src.to_string(),
@@ -1010,6 +1055,81 @@ fn is_valid_polymarket_wallet(s: &str) -> bool {
         return false;
     };
     rest.len() == 40 && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Distinct markets from open + closed positions for UI (`frontend.position_markets`).
+fn position_market_picks_from_augment(augment: &ReportAugment) -> Vec<PositionMarketPick> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<PositionMarketPick> = Vec::new();
+
+    for p in &augment.open_positions {
+        let Some(cid_raw) = p.condition_id.as_deref() else {
+            continue;
+        };
+        let cid = normalize_condition_id(cid_raw);
+        if cid.is_empty() {
+            continue;
+        }
+        let oc = p.outcome.as_deref().unwrap_or("").trim().to_lowercase();
+        let key = format!("{}|{}|open", cid.to_lowercase(), oc);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(PositionMarketPick {
+            condition_id: cid,
+            slug: p.slug.clone(),
+            title: p.title.clone(),
+            outcome: p.outcome.clone(),
+            status: "open".to_string(),
+            size: p.size,
+            avg_price: p.avg_price,
+            cash_pnl: p.cash_pnl,
+            realized_pnl: None,
+            current_value: p.current_value,
+        });
+    }
+
+    for c in &augment.closed_positions {
+        let Some(cid_raw) = c.condition_id.as_deref() else {
+            continue;
+        };
+        let cid = normalize_condition_id(cid_raw);
+        if cid.is_empty() {
+            continue;
+        }
+        let oc = c.outcome.as_deref().unwrap_or("").trim().to_lowercase();
+        let key = format!("{}|{}|closed", cid.to_lowercase(), oc);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(PositionMarketPick {
+            condition_id: cid,
+            slug: c.slug.clone(),
+            title: c.title.clone(),
+            outcome: c.outcome.clone(),
+            status: "closed".to_string(),
+            size: c.size,
+            avg_price: c.avg_price,
+            cash_pnl: None,
+            realized_pnl: c.realized_pnl,
+            current_value: None,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        let ta = a
+            .title
+            .clone()
+            .or(a.slug.clone())
+            .unwrap_or_else(|| a.condition_id.clone());
+        let tb = b
+            .title
+            .clone()
+            .or(b.slug.clone())
+            .unwrap_or_else(|| b.condition_id.clone());
+        ta.cmp(&tb)
+    });
+    out
 }
 
 /// Per-market Data API `/activity` with optional Postgres merge + incremental `start` fetch.
@@ -1368,6 +1488,42 @@ fn build_analyze_report(
         .sum();
     let open_positions_count = augment.open_positions.len();
 
+    let position_markets = position_market_picks_from_augment(augment);
+    let current_positions_fe: Vec<PositionRowDisplay> = augment
+        .open_positions
+        .iter()
+        .map(|p| PositionRowDisplay {
+            slug: p.slug.clone(),
+            title: p.title.clone(),
+            outcome: p.outcome.clone(),
+            size: p.size,
+            avg_price: p.avg_price,
+            cur_price: p.cur_price,
+            cash_pnl: p.cash_pnl,
+            current_value: p.current_value,
+            condition_id: p
+                .condition_id
+                .as_deref()
+                .map(normalize_condition_id)
+                .filter(|s| !s.is_empty()),
+        })
+        .collect();
+    let ai_account = format!(
+        "Polymarket wallet {} — account rollup from /positions + /closed-positions. Distinct markets ~{}. Use frontend.position_markets[].condition_id with GET /position-activity?market= for per-market activity.",
+        wallet, distinct_slugs_count
+    );
+    let frontend = FrontendPresentation {
+        biggest_wins: vec![],
+        biggest_losses: vec![],
+        recent_trades: vec![],
+        current_positions: current_positions_fe,
+        position_markets,
+        trade_ledger: vec![],
+        trade_ledger_paired: vec![],
+        trade_ledger_integrity: None,
+        ai_copy_prompt: ai_account,
+    };
+
     AnalyzeReport {
         schema_version: REPORT_SCHEMA_VERSION.to_string(),
         analysis_pipeline: Some("account".to_string()),
@@ -1419,10 +1575,10 @@ fn build_analyze_report(
         )),
         metrics_canonical_shadow: None,
         price_buckets_chart,
-        frontend: None,
+        frontend: Some(frontend),
         gamma_profile: augment.gamma_profile.clone(),
         notes: vec![
-            "Account rollup: from /positions + /closed-positions only (no /trades). lifetime.net_pnl = sum(open cashPnl + closed realizedPnl). net_pnl_settlement=0. Use GET /position-activity/:wallet?market= for per-market /activity.".into(),
+            "Account rollup: from /positions + /closed-positions only (no /trades). lifetime.net_pnl = sum(open cashPnl + closed realizedPnl). net_pnl_settlement=0. frontend.position_markets lists markets; drill down via GET /position-activity/:wallet?market=.".into(),
             format!(
                 "trades_count={} distinct markets (slug or condition_id); position rows={}.",
                 distinct_slugs_count, row_count
@@ -1936,7 +2092,7 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
                 )
                     .into_response();
             };
-            let cache_key = report_cache_key(&wallet, &cfg);
+            let cache_key = report_cache_key(&wallet, &cfg, q.no_gamma);
             match store
                 .get_cached_report(&cache_key, &wallet, cfg.cache_ttl_sec as i64)
                 .await
@@ -1951,7 +2107,15 @@ async fn serve(cfg: AppConfig, bind: String) -> anyhow::Result<()> {
                     .into_response(),
             }
         } else {
-            match analyze_wallet(&cfg, st.storage.as_ref(), &wallet, q.no_cache).await {
+            match analyze_wallet(
+                &cfg,
+                st.storage.as_ref(),
+                &wallet,
+                q.no_cache,
+                q.no_gamma,
+            )
+            .await
+            {
                 Ok(report) => (StatusCode::OK, Json(report)).into_response(),
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
