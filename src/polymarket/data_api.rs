@@ -225,29 +225,41 @@ impl DataApiClient {
             .await
     }
 
+    /// Polymarket Data API caps `limit` per route; exceeding it still returns at most that many rows.
+    /// `/closed-positions`: OpenAPI `maximum: 50` — must paginate with `limit <= 50` and advance `offset`
+    /// by returned length (or `limit` on full pages), otherwise a request with `limit=500` returns 50 rows
+    /// and callers incorrectly stop after the first page.
+    fn data_api_max_limit_per_request(path: &str) -> u32 {
+        match path {
+            "/closed-positions" => 50,
+            _ => 10_000,
+        }
+    }
+
     async fn paginate_user_endpoint<T: DeserializeOwned>(
         &self,
         path: &str,
         wallet: &str,
         page_limit: u32,
     ) -> anyhow::Result<Vec<T>> {
-        let limit: u32 = page_limit.clamp(1, 10_000);
+        let cap = Self::data_api_max_limit_per_request(path);
+        let limit: u32 = page_limit.clamp(1, cap);
         let mut out = Vec::new();
         let mut offset: u32 = 0;
         loop {
             let page = self
                 .user_json_page::<T>(path, wallet, limit, offset)
                 .await
-                .with_context(|| format!("fetch data-api {path} offset={offset}"))?;
+                .with_context(|| format!("fetch data-api {path} offset={offset} limit={limit}"))?;
             if page.is_empty() {
                 break;
             }
             let n = page.len();
             out.extend(page);
+            offset = offset.saturating_add(n as u32);
             if (n as u32) < limit {
                 break;
             }
-            offset = offset.saturating_add(limit);
             tokio::time::sleep(self.rate_limit).await;
         }
         Ok(out)
